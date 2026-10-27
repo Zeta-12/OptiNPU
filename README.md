@@ -1,0 +1,120 @@
+# optinpu
+
+Train object detectors anywhere, run them on the Intel NPU.
+
+```python
+from optinpu import Detector
+
+model = Detector("dfine-s")
+dets = model.predict("image.jpg", device="npu")   # also "cpu", "gpu", "npu+gpu", "torch"
+print(dets)                                      # Detections(5: cat 0.96, cat 0.95, ...)
+print(model.benchmark())                         # latency / throughput on CPU, GPU, NPU
+```
+
+```
+optinpu devices
+optinpu models
+optinpu predict dfine-n image.jpg --device npu --save out.jpg
+optinpu bench dfine-s --devices cpu,gpu,npu --stages
+optinpu export dfine-n --precision int8          # calibrates on 300 COCO val images
+optinpu eval dfine-n --devices cpu,npu --precisions fp16,int8 --images 500
+optinpu profile dfine-n --device npu
+```
+
+## Training
+
+```python
+model = Detector("dfine-n")
+model.train(("train.json", "images/"), ("val.json", "images/"), epochs=12, batch=8)
+model.predict("image.jpg", device="npu")               # trained weights, exported on demand
+
+model = Detector.from_checkpoint("dfine-n", "runs/dfine-n/train/best.pt")
+```
+
+```
+optinpu train dfine-n --train train.json images/ --val val.json images/ --epochs 12
+optinpu predict dfine-n image.jpg --checkpoint runs/dfine-n/train/best.pt --device npu
+```
+
+Datasets are COCO-format (images folder + instances json). New classes re-create the class heads.
+Training runs on the Intel iGPU (PyTorch XPU) when available, otherwise CUDA or CPU. The first
+iGPU run JIT-compiles kernels (~17 min for D-FINE); they are cached on disk afterwards.
+`examples/finetune_animals.py` fine-tunes on 10 COCO animal classes (62.6 AP, 26 ms on NPU).
+
+## Data
+
+COCO data (annotations + only the needed images) is downloaded on demand to
+`~/.cache/optinpu/coco` (override with `OPTINPU_DATA`). Evaluation uses val2017 images
+`[0, N)` sorted by id; INT8 calibration uses `[4500, 4800)`, so the two never overlap.
+
+## Install
+
+Python 3.10 to 3.13 (3.14 is not yet supported by OpenVINO / PyTorch XPU).
+
+```
+py -3.12 -m venv .venv
+.venv\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu
+.venv\Scripts\pip install -e ".[dev]"
+```
+
+## How models reach the NPU
+
+`Detector.export()` produces a static-shape OpenVINO IR that is correct on the NPU:
+
+1. **Freeze** input-independent tensors (sin-cos position embeddings, anchors) as FP32 constants,
+   clipping float32-max sentinels that would become `inf` in FP16.
+2. **Patch** modules the NPU compiler mishandles with exact rewrites (`optinpu.npu_patches`).
+3. **Fold** remaining constant subgraphs before FP16 weight compression.
+
+## Hybrid NPU + GPU
+
+`device="npu+gpu"` runs the backbone and encoder (large convolutions, what the NPU is good at) on
+the NPU and the DETR decoder (hundreds of small, irregular ops) on the iGPU. Intermediate tensors
+are handed over without copies. It is the fastest placement for every registered model:
+
+| model (640×640) | CPU | GPU | NPU | **NPU+GPU** | AP (500 COCO val images) |
+|---|---|---|---|---|---|
+| `rtdetrv2-r18` | 227 ms | 44.0 ms | 81.0 ms | **33.9 ms** | 50.8 |
+| `dfine-s` | 128 ms | 40.7 ms | 46.2 ms | **33.6 ms** | 51.5 |
+| `dfine-n` | 48 ms | 16.6 ms | 25.2 ms | **15.9 ms** | 45.7 |
+
+## Checking a model: npu_lint
+
+```
+optinpu lint dfine-n --image image.jpg      # registered model
+optinpu lint path/to/model.xml              # any OpenVINO IR
+```
+
+Static rules (dynamic shapes, float tensors computed from shapes, FP16 range, pooling patterns the
+NPU compiler mishandles, slow ops), then compilation on the NPU (locating the failing op if any),
+an accuracy check against CPU FP32 and, if outputs drift, an automatic retry with `NPU_TILES=1`.
+
+When a model misbehaves on the NPU, `optinpu.diagnose` finds the culprit:
+
+- `locate_divergence_split(ir, inputs)`: runs ops[:k] on the NPU and the rest on CPU, bisects k.
+  The prefix is compiled as a whole, so compiler fusions and tiling are reproduced.
+- `locate_divergence(ir, inputs)`: first op whose NPU output differs from CPU (per-op probes;
+  exposing outputs can hide fusion bugs).
+- `locate_compile_failure(ir)`: first op that makes the NPU compiler fail.
+
+## Measuring
+
+- `Detector.evaluate()` / `optinpu eval`: COCO bbox mAP (pycocotools) on any device and precision.
+- `Detector.benchmark()`: batch-1 latency and async throughput.
+- `Detector.benchmark_stages()`: real latency of cumulative stages (backbone, +encoder, full),
+  measured on truncated graphs.
+- `optinpu.profile`: per-layer times. On the NPU, tasks overlap, so use shares, not sums.
+
+## Models
+
+| name | source | NPU |
+|---|---|---|
+| `dfine-n` | D-FINE nano, COCO | ok |
+| `dfine-s` | D-FINE small, COCO | ok |
+| `rtdetrv2-r18` | RT-DETRv2 R18, COCO | ok with `NPU_TILES=1` (applied automatically, slower); prefer `npu+gpu` |
+
+## Tests
+
+```
+.venv\Scripts\python -m pytest
+```

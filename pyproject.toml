@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optinpu"
+version = "0.1.0"
+description = "Train object detectors anywhere, run them on the Intel NPU."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<3.14"
+keywords = ["object detection", "npu", "openvino", "intel", "d-fine", "rt-detr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "numpy",
+    "pillow",
+    "openvino>=2025.0",
+    "nncf>=2.14",
+    "torch>=2.5",
+    "torchvision",
+    "transformers>=4.50",  # pretrained D-FINE / RT-DETRv2 and their training losses
+    "scipy",               # Hungarian matching in DETR losses
+    "pycocotools",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "build"]
+
+[project.scripts]
+optinpu = "optinpu.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
