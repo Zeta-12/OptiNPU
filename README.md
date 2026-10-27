@@ -39,7 +39,15 @@ optinpu predict dfine-n image.jpg --checkpoint runs/dfine-n/train/best.pt --devi
 Datasets are COCO-format (images folder + instances json). New classes re-create the class heads.
 Training runs on the Intel iGPU (PyTorch XPU) when available, otherwise CUDA or CPU. The first
 iGPU run JIT-compiles kernels (~17 min for D-FINE); they are cached on disk afterwards.
-`examples/finetune_animals.py` fine-tunes on 10 COCO animal classes (62.6 AP, 26 ms on NPU).
+`examples/finetune_animals.py` fine-tunes on 10 COCO animal classes (62.6 AP).
+
+**Frozen backbone on the NPU.** `train(..., backbone_device="npu")` freezes the backbone, runs it on
+the NPU and computes the next batch's features there while the iGPU trains the rest: 2x faster
+fine-tuning (10.4 vs 5.1 img/s for D-FINE-N) for the same accuracy (62.1 vs 62.6 AP on the
+animals example). `freeze_backbone=True` alone gives 7.4 img/s.
+
+Computing gradients on the NPU itself was explored and dropped (slower than the CPU on
+convolutions, fragile compiler); see PLAN.md, L5.
 
 ## Data
 
@@ -78,6 +86,9 @@ are handed over without copies. It is the fastest placement for every registered
 | `dfine-s` | 128 ms | 40.7 ms | 46.2 ms | **33.6 ms** | 51.5 |
 | `dfine-n` | 48 ms | 16.6 ms | 25.2 ms | **15.9 ms** | 45.7 |
 
+NPU column measured with 2 NPU tiles (D-FINE) or 1 (RT-DETRv2). With the current default of 1
+tile for all DETR models, D-FINE-N on the NPU alone takes ~43 ms.
+
 ## Checking a model: npu_lint
 
 ```
@@ -111,10 +122,15 @@ When a model misbehaves on the NPU, `optinpu.diagnose` finds the culprit:
 |---|---|---|
 | `dfine-n` | D-FINE nano, COCO | ok |
 | `dfine-s` | D-FINE small, COCO | ok |
-| `rtdetrv2-r18` | RT-DETRv2 R18, COCO | ok with `NPU_TILES=1` (applied automatically, slower); prefer `npu+gpu` |
+| `rtdetrv2-r18` | RT-DETRv2 R18, COCO | ok |
+
+On the NPU alone, all DETR models compile with `NPU_TILES=1`: splitting the decoder attention over
+2 tiles is wrong in the NPU compiler (-3.6 AP on a fine-tuned D-FINE-N, unusable RT-DETRv2). One
+tile is exact but slower; `npu+gpu` is both exact and the fastest.
 
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest
+.venv\Scripts\python -m pytest       # 35 tests, ~10 s; NPU tests are skipped without an NPU
+.venv\Scripts\ruff check src tests examples
 ```

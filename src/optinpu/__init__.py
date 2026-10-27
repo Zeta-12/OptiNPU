@@ -6,13 +6,14 @@ import os
 # Without a persistent cache every new process pays that again. Must be set before torch loads.
 os.environ.setdefault("SYCL_CACHE_PERSISTENT", "1")
 
-from optinpu.devices import available_devices, torch_device
-from optinpu.export import export_openvino
-from optinpu.runtime import CompiledModel, compile_model
-from optinpu.bench import benchmark
-from optinpu.detector import Detector
-from optinpu.models import list_models
-from optinpu.postprocess import Detections
+from optinpu.devices import available_devices, torch_device  # noqa: E402
+from optinpu.export import export_openvino  # noqa: E402
+from optinpu.runtime import CompiledModel, HybridModel, compile_hybrid, compile_model  # noqa: E402
+from optinpu.bench import benchmark  # noqa: E402
+from optinpu.detector import Detector  # noqa: E402
+from optinpu.lint import lint  # noqa: E402
+from optinpu.models import list_models  # noqa: E402
+from optinpu.postprocess import Detections  # noqa: E402
 
 __version__ = "0.1.0"
 
@@ -24,6 +25,9 @@ __all__ = [
     "torch_device",
     "export_openvino",
     "CompiledModel",
+    "HybridModel",
     "compile_model",
+    "compile_hybrid",
     "benchmark",
+    "lint",
 ]

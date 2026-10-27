@@ -93,7 +93,7 @@ model.benchmark(device=["cpu", "gpu", "npu"])     # latence, débit
 - [x] L2 — 2026-10-27. mAP COCO (sous-ensemble val2017), INT8 NNCF, profilage par couche et par étage, CLI `export | eval | profile`, 22 tests. Conclusion : l'INT8 n'accélère pas D-FINE sur NPU (voir journal).
 - [x] L3 — 2026-10-27. `Detector.train()` / `optinpu train` sur dataset au format COCO, iGPU (XPU), EMA, tête réinitialisée si nouvelles classes, `from_checkpoint`. D-FINE-N fine-tuné sur COCO-animaux (10 classes) : 62,6 AP (PyTorch), 63,0 AP sur NPU, 26 ms. 26 tests.
 - [x] L4 — 2026-10-27. `npu_lint` (CLI `lint`), `diagnose.locate_divergence_split`, exécution hybride `npu+gpu` (la plus rapide sur les 3 modèles), RT-DETRv2 exact sur NPU (`NPU_TILES=1`), packaging v0.1.0 (wheel, licence Apache-2.0), dépôt git local, 32 tests. QAT reportée à M2 : sans intérêt tant que le modèle ne profite pas de l'INT8 sur ce NPU.
-- [ ] L5
+- [x] L5 — 2026-10-28. Note de faisabilité ci-dessous. Livrable : `train(..., backbone_device="npu")` (backbone gelé sur NPU, ×2 sur le fine-tuning). Calcul de gradients sur NPU abandonné. Une seule tuile NPU devient le réglage par défaut des modèles DETR. Nettoyage final de la librairie (ruff, code mort retiré), 35 tests.
 
 ## Journal technique NPU
 
@@ -107,6 +107,7 @@ Pièges du compilateur NPU rencontrés (driver 32.0.100.4778, OpenVINO 2026.4) e
 | Embeddings sin-cos recalculés (`10000 ** x`) en FP16 | Erreur relative de 8,7e3 | Gel en buffers constants |
 | Self-attention du décodeur répartie sur 2 tuiles NPU (RT-DETRv2 ; D-FINE légèrement touché) | Scores dégradés (erreur 0,42), chaque op isolée juste ; sorties identiques au bit près quelle que soit la réécriture du graphe | `NPU_TILES=1` (exact, mais 81 ms au lieu de 47), ou exécution hybride `npu+gpu` |
 | `EXECUTION_MODE_HINT=ACCURACY` sur NPU | 0 détection (D-FINE et RT-DETRv2) | Ne pas utiliser |
+| Graphes de rétropropagation de convolutions | Compilateur à 53-55 Go de mémoire virtuelle, machine saturée | Ne pas compiler de gradients de convolutions sur NPU (piste L5 abandonnée) |
 
 Mesures D-FINE (640×640, FP16, batch 1) :
 
@@ -170,6 +171,51 @@ Mesures sur 500 images COCO val, 640×640, batch 1 :
 
 - Le NPU exécute le backbone et l'encodeur (convolutions larges), l'iGPU le décodeur (petites ops). Seuls 4 à 6 tenseurs transitent, sans copie, ce qui fait gagner 10 ms par rapport à un chaînage naïf.
 - Le décodeur sur 1 tuile NPU est 2 fois plus lent que sur 2 tuiles : la répartition sur 2 tuiles accélère réellement, mais elle est fautive pour l'attention.
+
+### L5 — entraîner avec le NPU : note de faisabilité
+
+**Piste 1 — calculer des gradients sur le NPU (abandonnée, code retiré).** La passe avant et la rétropropagation étaient tracées en graphe statique (`torch.func.grad` + `make_fx`), converties en OpenVINO et compilées sur le NPU ; les poids étaient des entrées, les gradients des sorties, la mise à jour se faisait sur l'hôte.
+
+- **Précision** : bonne avec le loss scaling (×1024), cosinus de 0,9997 ou plus avec le gradient FP32. Sans loss scaling, les gradients de convolution sont **tous nuls** (sous-dépassement FP16). Un classifieur entraîné 400 pas avec les gradients du NPU converge exactement comme avec ceux du CPU (loss 2,116 → 0,404, précision 91,9 % contre 91,8 %).
+- **Vitesse**, pour un pas complet (passe avant + rétropropagation) :
+
+| MLP (tokens × largeur) | CPU OpenVINO | iGPU OpenVINO | **NPU** | PyTorch iGPU |
+|---|---|---|---|---|
+| 300 × 256 | 4,9 ms | 11,4 | 7,6 | 1,7 |
+| 2048 × 512 | 76 | 126 | **27** | 18 |
+| 4096 × 1024 | 529 | 629 | **139** | 136 |
+| 8192 × 1024 | 1083 | 1252 | **297** | 259 |
+
+  Sur les convolutions (64 canaux, 40×40), le NPU met 59 ms contre 12 ms sur CPU.
+- **Pièges du compilateur NPU propres à la rétropropagation** :
+  - `ConvolutionBackpropData` avec peu de canaux donne un résultat faux ; contourné par une convolution ordinaire à noyau retourné quand le pas vaut 1.
+  - Le gradient des poids calculé comme une convolution dont les canaux sont le batch est faux pour les petits batchs ; contourné par un MatMul par position du noyau.
+  - Le découpage avec un pas de 2 ne compile pas (« Max striding levels exceeded »), et sa reformulation par reshape 6D plante parfois (« bad allocation »). **Les convolutions à pas supérieur à 1 ne sont pas fiables.**
+  - Le graphe de gradients doit être replié (constant folding) avant compilation.
+  - `cross_entropy` doit être écrite explicitement, sa décomposition ne se convertit pas.
+  - **Incident** : sur certains graphes de gradients de convolutions, le compilateur NPU (qui tourne dans le processus Python) monte à 53-55 Go de mémoire virtuelle sans échouer. La mémoire de la machine sature (alertes « Resource-Exhaustion-Detector » dans le journal Windows), ce qui a fait planter Claude Code et Edge. **Ne jamais compiler sur le NPU un graphe non éprouvé sans surveiller la mémoire, et vérifier qu'aucun processus de compilation ne survit à une interruption.**
+- **Verdict** : faisable pour des têtes MLP ou à base de transformers (MatMul), où le NPU égale l'iGPU. **Pas rentable pour un détecteur convolutif** : plus lent que le CPU, fragile, et l'iGPU est meilleur. Piste abandonnée le 2026-10-28 ; le code (`npu_grad`) a été retiré.
+
+**Piste 2 — backbone gelé exécuté sur le NPU** (`train(..., backbone_device="npu")`). Le NPU calcule les features du batch suivant pendant que l'iGPU entraîne l'encodeur et le décodeur sur le batch courant.
+
+| Fine-tuning D-FINE-N, COCO-animaux, batch 8 | Durée par epoch | Débit | AP val (CPU) | Epochs |
+|---|---|---|---|---|
+| Complet, iGPU (L3) | 142 s | 5,1 img/s | 62,6 | 12 |
+| Backbone gelé, iGPU (A) | 98 s | 7,4 img/s | 62,5 | 8 |
+| **Backbone gelé, NPU en parallèle (B)** | **70 s** | **10,4 img/s** | 62,1 | 8 |
+
+- **×2 sur le temps d'entraînement** pour la même précision à 0,5 point près. Pas idéal mesuré sur l'iGPU : 1 514 ms complet, 1 007 ms backbone gelé, 666 ms avec features fournies. Le NPU produit 22,7 img/s de features, ce qui suffit.
+- Le compilateur NPU journalise « MultiClusterStrategyAssignment … unsupported batch size » sur le backbone en batch 8 : bruit, la compilation réussit.
+
+**Découverte en vérifiant les modèles fine-tunés** : le défaut de l'attention répartie sur 2 tuiles touche aussi D-FINE.
+
+| Modèle fine-tuné (val animaux) | CPU | NPU 2 tuiles | NPU 1 tuile | NPU+iGPU |
+|---|---|---|---|---|
+| Complet | 62,5 | 63,0 | 62,4 | 62,3 |
+| Backbone gelé (A) | 62,4 | **58,8** | 62,2 | 62,1 |
+| Backbone gelé sur NPU (B) | 62,3 | 61,3 | 62,0 | 62,1 |
+
+`npu_lint` signale les 3 modèles (écart de 0,18 à 0,61) et recommande une seule tuile. **`NPU_TILES=1` est désormais le défaut pour toute la famille DETR** : une perte silencieuse de 3,6 AP est pire qu'une latence plus élevée (D-FINE-N : 25 → 43 ms en NPU seul). Le mode hybride `npu+gpu` reste le plus rapide et il est exact (15,7 ms).
 
 Enseignements pour OptiDet (M0-M2) :
 - **Le placement hybride est la référence à battre** : OptiDet doit être plus rapide en NPU seul que D-FINE en NPU+GPU, ou être conçu lui-même pour un placement hybride (tête NPU lourde, décodeur GPU minimal).

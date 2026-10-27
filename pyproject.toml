@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "build"]
+dev = ["pytest", "build", "ruff"]
 
 [project.scripts]
 optinpu = "optinpu.cli:main"
@@ -43,3 +43,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E731", "B905"]

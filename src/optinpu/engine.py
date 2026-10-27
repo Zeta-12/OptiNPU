@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -33,6 +35,10 @@ class TrainConfig:
     device: str | None = None
     max_steps: int | None = None  # stop early (smoke tests)
     log_every: int = 20
+    freeze_backbone: bool = False
+    # Run the (frozen) backbone on another OpenVINO device, e.g. "npu": features of the next batch
+    # are computed there while the training device processes the current one.
+    backbone_device: str | None = None
 
 
 @dataclass
@@ -80,6 +86,37 @@ class TorchPredictor:
         return decode(scores[0].float().cpu().numpy(), boxes[0].float().cpu().numpy(), image.size, self.class_names, conf=conf)
 
 
+def _compile_backbone(model: nn.Module, cfg: TrainConfig, imgsz, out_dir: Path):
+    """Export the frozen backbone with the training batch size and compile it on cfg.backbone_device."""
+    from optinpu.export import export_openvino
+    from optinpu.runtime import compile_model
+
+    module = copy.deepcopy(model.backbone_features_module()).cpu().eval()
+    ir = export_openvino(module, out_dir / "backbone.xml", input_shape=(cfg.batch, 3, *imgsz))
+    print(f"Frozen backbone compiled on {cfg.backbone_device.upper()} ({ir})")
+    # THROUGHPUT makes the NPU compiler try (and log a failure for) batch splitting across tiles
+    return compile_model(ir, cfg.backbone_device, hint="LATENCY")
+
+
+def _batches(loader, external_backbone):
+    """Yield (pixels, targets, features or None). With an external backbone, the features of the
+    next batch are computed in a worker thread while the caller trains on the current one
+    (OpenVINO releases the GIL during inference)."""
+    if external_backbone is None:
+        for pixels, targets in loader:
+            yield pixels, targets, None
+        return
+    with ThreadPoolExecutor(1) as pool:
+        it = iter(loader)
+        nxt = next(it, None)
+        future = pool.submit(external_backbone, nxt[0].numpy()) if nxt else None
+        while nxt is not None:
+            current, current_future = nxt, future
+            nxt = next(it, None)
+            future = pool.submit(external_backbone, nxt[0].numpy()) if nxt else None
+            yield current[0], current[1], current_future.result()
+
+
 def _param_groups(model: nn.Module, cfg: TrainConfig) -> list[dict]:
     backbone, no_decay, rest = [], [], []
     for name, p in model.named_parameters():
@@ -112,6 +149,13 @@ def train(
     device = torch_device(cfg.device)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    external_backbone = None
+    if cfg.freeze_backbone or cfg.backbone_device:
+        for p in model.backbone.parameters():
+            p.requires_grad_(False)
+    if cfg.backbone_device:
+        external_backbone = _compile_backbone(model, cfg, train_set.imgsz, out_dir)
     model = model.to(device).train()
     ema = EMA(model, cfg.ema_decay)
 
@@ -139,12 +183,15 @@ def train(
     for epoch in range(cfg.epochs):
         model.train()
         t0, losses = time.perf_counter(), []
-        for pixels, targets in loader:
+        for pixels, targets, features in _batches(loader, external_backbone):
             for g, base in zip(optimizer.param_groups, base_lrs):
                 g["lr"] = base * lr_factor(step)
             pixels = pixels.to(device, non_blocking=True)
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.amp):
+            backbone_ctx = contextlib.nullcontext()
+            if features is not None:
+                backbone_ctx = model.external_backbone([torch.from_numpy(f).to(device) for f in features])
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.amp), backbone_ctx:
                 loss, parts = model.loss(pixels, targets)
             if not torch.isfinite(loss):
                 print(f"step {step}: non-finite loss, batch skipped")

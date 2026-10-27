@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
 
         for name in list_models():
             spec = get_model(name)
-            note = "  [NPU issue]" if spec.npu_issue else ""
+            note = f"  NPU config {spec.npu_config}" if spec.npu_config else ""
             print(f"{name:<14} {spec.source}{note}")
     elif args.command == "predict":
         from optinpu import Detector

@@ -7,6 +7,7 @@ This contract keeps decoding identical across PyTorch, CPU, GPU and NPU.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -26,7 +27,6 @@ class ModelSpec:
     mean: tuple[float, float, float] | None = None
     std: tuple[float, float, float] | None = None
     source: str = ""
-    npu_issue: str | None = None  # known NPU problem, shown as a warning at predict time
     npu_config: dict = field(default_factory=dict)  # NPU compile properties needed for correctness
     # cumulative stage label -> op-name regex, for bench.benchmark_stages
     stages: dict[str, str] = field(default_factory=dict)
@@ -87,6 +87,28 @@ class HFDetrWrapper(nn.Module):
         detr.register_buffer("frozen_valid_mask", valid_mask, persistent=False)
         detr.generate_anchors = lambda *a, **k: (detr.frozen_anchors, detr.frozen_valid_mask)
 
+    @property
+    def backbone(self) -> nn.Module:
+        return self.model.model.backbone
+
+    def backbone_features_module(self) -> nn.Module:
+        """pixels -> tuple of backbone feature maps, exportable to the NPU."""
+        return _BackboneFeatures(self.backbone)
+
+    @contextlib.contextmanager
+    def external_backbone(self, features: list[torch.Tensor]):
+        """Within the block, the backbone returns `features` instead of computing them.
+
+        Used to train with a frozen backbone executed elsewhere (e.g. on the NPU).
+        """
+        masks = [torch.ones(f.shape[0], *f.shape[2:], dtype=torch.bool, device=f.device) for f in features]
+        original = self.backbone.forward
+        self.backbone.forward = lambda *a, **k: list(zip(features, masks))
+        try:
+            yield
+        finally:
+            self.backbone.forward = original
+
     def loss(self, pixels: torch.Tensor, targets: list[dict]) -> tuple[torch.Tensor, dict[str, float]]:
         """Training loss. targets: [{"class_labels": (N,), "boxes": (N, 4) normalized cxcywh}]."""
         labels = [{"class_labels": t["class_labels"], "boxes": t["boxes"]} for t in targets]
@@ -99,6 +121,16 @@ class HFDetrWrapper(nn.Module):
         cx, cy, w, h = out.pred_boxes.unbind(-1)
         boxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
         return scores, boxes
+
+
+class _BackboneFeatures(nn.Module):
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, pixels: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        mask = torch.ones(pixels.shape[0], *pixels.shape[2:], device=pixels.device)
+        return tuple(f for f, _ in self.backbone(pixels, mask))
 
 
 def _hf_detr(repo: str) -> Callable[..., nn.Module]:
@@ -127,13 +159,14 @@ def register(spec: ModelSpec) -> None:
     _REGISTRY[spec.name] = spec
 
 
-# The RT-DETRv2 decoder self-attention is wrong when the NPU compiler splits it over 2 tiles
-# (OpenVINO 2026.4, driver 32.0.100.4778). One tile is exact but slower: prefer device="npu+gpu".
+# DETR decoder self-attention is wrong when the NPU compiler splits it over 2 tiles (OpenVINO
+# 2026.4, driver 32.0.100.4778): -0.2 AP on pretrained D-FINE, up to -3.6 AP on fine-tuned D-FINE,
+# unusable RT-DETRv2. One tile is exact but slower: prefer device="npu+gpu" for speed.
 _ONE_TILE = {"NPU_TILES": 1}
 
 for _name, _repo, _npu_config in (
-    ("dfine-n", "ustc-community/dfine-nano-coco", {}),
-    ("dfine-s", "ustc-community/dfine-small-coco", {}),
+    ("dfine-n", "ustc-community/dfine-nano-coco", _ONE_TILE),
+    ("dfine-s", "ustc-community/dfine-small-coco", _ONE_TILE),
     ("rtdetrv2-r18", "PekingU/rtdetr_v2_r18vd", _ONE_TILE),
 ):
     register(ModelSpec(

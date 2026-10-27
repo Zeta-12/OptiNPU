@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import warnings
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -15,6 +15,9 @@ from optinpu.export import export_openvino
 from optinpu.models import get_model
 from optinpu.postprocess import Detections, decode, load_image, preprocess
 from optinpu.runtime import CompiledModel, HybridModel, compile_hybrid, compile_model
+
+if TYPE_CHECKING:
+    from optinpu.engine import TrainResult
 
 
 class Detector:
@@ -41,8 +44,7 @@ class Detector:
             self.model = self.spec.builder(pretrained).eval()
         self.workdir = Path(workdir) / name
         self._ir: dict[str, Path] = {}
-        self._compiled: dict[str, CompiledModel] = {}
-        self._warned = False
+        self._compiled: dict[str, CompiledModel | HybridModel] = {}
 
     @classmethod
     def from_checkpoint(cls, name: str, checkpoint: str | Path, workdir: str | Path | None = None) -> "Detector":
@@ -62,7 +64,7 @@ class Detector:
     def class_names(self) -> list[str]:
         return self.spec.class_names
 
-    def train(self, data, val=None, run: str = "train", **config) -> "TrainResult":
+    def train(self, data, val=None, run: str = "train", **config) -> TrainResult:
         """Fine-tune on a COCO-format dataset, then keep the best EMA weights.
 
         data / val: CocoDetection, CocoSubset, or (annotations_json, image_dir).
@@ -173,9 +175,6 @@ class Detector:
         `device`: "cpu", "gpu", "npu", hybrid "npu+gpu" / "npu+cpu", or "torch" (PyTorch model,
         reference path, no export).
         """
-        if self.spec.npu_issue and device.lower() == "npu" and not self._warned:
-            warnings.warn(f"{self.name}: {self.spec.npu_issue}", stacklevel=2)
-            self._warned = True
         image = load_image(source)
         x = preprocess(image, self.spec.imgsz, self.spec.mean, self.spec.std)
         if device == "torch":

@@ -40,7 +40,7 @@ def profile(model: str | Path | ov.Model, device: str = "npu", iterations: int =
             if info.status == info.Status.EXECUTED:
                 totals[(info.node_name, info.node_type, info.exec_type)] += info.real_time.total_seconds() * 1e3
     layers = [LayerTime(n, t, e, ms / iterations) for (n, t, e), ms in totals.items()]
-    return sorted(layers, key=lambda l: -l.ms)
+    return sorted(layers, key=lambda layer: -layer.ms)
 
 
 def by_type(layers: list[LayerTime], key: str = "node_type") -> list[tuple[str, float, int]]:
@@ -53,7 +53,7 @@ def by_type(layers: list[LayerTime], key: str = "node_type") -> list[tuple[str, 
 
 
 def format_profile(layers: list[LayerTime], top: int = 15) -> str:
-    total = sum(l.ms for l in layers)
+    total = sum(layer.ms for layer in layers)
     lines = [
         f"sum of layer times {total:.2f} ms over {len(layers)} layers",
         "(the NPU overlaps tasks: compare shares, not absolute sums; use bench.benchmark_stages for real latency)",
@@ -63,6 +63,6 @@ def format_profile(layers: list[LayerTime], top: int = 15) -> str:
     for t, ms, n in by_type(layers)[:top]:
         lines.append(f"{t:<28} {ms:>8.2f} {100 * ms / total:>6.1f} {n:>5}")
     lines += ["", f"{'slowest layers':<70} {'ms':>8}"]
-    for l in layers[:top]:
-        lines.append(f"{(l.node_type + ' ' + l.name)[:70]:<70} {l.ms:>8.2f}")
+    for layer in layers[:top]:
+        lines.append(f"{(layer.node_type + ' ' + layer.name)[:70]:<70} {layer.ms:>8.2f}")
     return "\n".join(lines)
