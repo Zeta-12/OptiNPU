@@ -49,6 +49,25 @@ animals example). `freeze_backbone=True` alone gives 7.4 img/s.
 Computing gradients on the NPU itself was explored and dropped (slower than the CPU on
 convolutions, fragile compiler); see PLAN.md, L5.
 
+**Quantization-aware training (INT8 without accuracy loss).** Post-training INT8 costs OptiDet-N
+1.5 AP; a short QAT fine-tuning of the trained model recovers all of it (10.0 AP in INT8 on the
+NPU, same as FP32, 3.4 ms):
+
+```python
+model = Detector.from_checkpoint("optidet-n", "runs/optidet-n/train/best.pt")
+model.train_qat(("train.json", "images/"), ("val.json", "images/"))   # 2 epochs, lr 1e-4
+model.predict("image.jpg", device="npu")    # INT8 by default from now on
+```
+
+```
+optinpu qat optidet-n --checkpoint runs/optidet-n/train/best.pt --train train.json images/ --val val.json images/
+```
+
+NNCF inserts fake quantizers into the fused model, training continues through them, and the INT8
+IR is exported straight from the trained quantizers. The QAT checkpoint (`<run>/qat/best.pt`)
+reloads with `from_checkpoint`. Supported by OptiDet; the DETR models gain nothing from INT8 on
+this NPU (PLAN.md, L2).
+
 ## Data
 
 COCO data (annotations + only the needed images) is downloaded on demand to
@@ -123,6 +142,7 @@ When a model misbehaves on the NPU, `optinpu.diagnose` finds the culprit:
 | `dfine-n` | D-FINE nano, COCO | ok |
 | `dfine-s` | D-FINE small, COCO | ok |
 | `rtdetrv2-r18` | RT-DETRv2 R18, COCO | ok |
+| `optidet-n` | OptiDet prototype, ImageNet RepVGG-A0 backbone only: train it first | ok, 2 tiles, INT8 |
 
 On the NPU alone, all DETR models compile with `NPU_TILES=1`: splitting the decoder attention over
 2 tiles is wrong in the NPU compiler (-3.6 AP on a fine-tuned D-FINE-N, unusable RT-DETRv2). One
@@ -131,6 +151,6 @@ tile is exact but slower; `npu+gpu` is both exact and the fastest.
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest       # 35 tests, ~10 s; NPU tests are skipped without an NPU
+.venv\Scripts\python -m pytest       # 55 tests, ~25 s; NPU tests are skipped without an NPU
 .venv\Scripts\ruff check src tests examples
 ```

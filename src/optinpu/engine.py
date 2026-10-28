@@ -142,8 +142,10 @@ def train(
     cfg: TrainConfig,
     out_dir: str | Path,
     name: str = "model",
+    checkpoint_extra: dict | None = None,
 ) -> TrainResult:
-    """Train `model` (must expose .loss(pixels, targets)); keep the best EMA weights by val mAP."""
+    """Train `model` (must expose .loss(pixels, targets)); keep the best EMA weights by val mAP.
+    `checkpoint_extra` entries are saved in the checkpoint as is (e.g. the QAT quantizer config)."""
     from optinpu.evaluate import evaluate_coco
 
     device = torch_device(cfg.device)
@@ -227,7 +229,7 @@ def train(
         if score > result.best_ap:
             result.best_ap, result.best_epoch = score, epoch
             torch.save({"state_dict": ema.module.state_dict(), "class_names": train_set.class_names,
-                        "epoch": epoch, "config": asdict(cfg)}, result.checkpoint)
+                        "epoch": epoch, "config": asdict(cfg), **(checkpoint_extra or {})}, result.checkpoint)
         (out_dir / "history.json").write_text(json.dumps(result.history, indent=2))
         if cfg.max_steps and step >= cfg.max_steps:
             break

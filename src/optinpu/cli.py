@@ -1,4 +1,4 @@
-"""Command line interface: optinpu devices | models | predict | bench | export | eval | train | profile."""
+"""Command line interface: optinpu devices | models | predict | bench | export | eval | train | qat | lint | profile."""
 
 from __future__ import annotations
 
@@ -48,6 +48,17 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--lr", type=float, default=2e-4)
     t.add_argument("--device")
     t.add_argument("--amp", action="store_true", help="bf16 autocast")
+
+    q = sub.add_parser("qat", help="quantization-aware fine-tuning of a trained model, then INT8 export")
+    q.add_argument("model")
+    q.add_argument("--checkpoint", required=True, help="best.pt from `optinpu train`")
+    q.add_argument("--train", nargs=2, metavar=("JSON", "IMAGES"), required=True)
+    q.add_argument("--val", nargs=2, metavar=("JSON", "IMAGES"))
+    q.add_argument("--run", default="qat")
+    q.add_argument("--epochs", type=int, default=2)
+    q.add_argument("--batch", type=int, default=8)
+    q.add_argument("--lr", type=float, default=1e-4)
+    q.add_argument("--device")
 
     n = sub.add_parser("lint", help="check NPU compatibility: static rules, compilation, accuracy vs CPU")
     n.add_argument("model", help="registered model name, or path to an OpenVINO .xml")
@@ -122,6 +133,16 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"best epoch {result.best_epoch}, checkpoint {result.checkpoint}")
         print(f"NPU IR: {detector.export(precision='fp16')}")
+    elif args.command == "qat":
+        from optinpu import Detector
+
+        detector = Detector.from_checkpoint(args.model, args.checkpoint)
+        result = detector.train_qat(
+            tuple(args.train), tuple(args.val) if args.val else None, run=args.run,
+            epochs=args.epochs, batch=args.batch, lr=args.lr, backbone_lr=args.lr, device=args.device,
+        )
+        print(f"best epoch {result.best_epoch}, checkpoint {result.checkpoint}")
+        print(f"NPU IR (int8): {detector.export()}")
     elif args.command == "lint":
         if args.model.endswith(".xml"):
             from optinpu.lint import lint
