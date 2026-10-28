@@ -17,6 +17,24 @@ def test_dataset_targets_are_normalized_cxcywh(toy_coco):
     assert target["class_labels"].tolist() == [1]
 
 
+def test_random_zoom_keeps_boxes_consistent():
+    import numpy as np
+    from PIL import Image
+
+    from optinpu.data.dataset import random_zoom
+
+    image = Image.new("RGB", (200, 100))
+    boxes = np.array([[20, 10, 60, 40], [150, 60, 40, 30]], dtype=np.float32)  # xywh
+    labels = np.array([0, 1])
+    for seed in range(50):
+        random.seed(seed)
+        img, b, lab = random_zoom(image, boxes.copy(), labels.copy())
+        w, h = img.size
+        assert len(b) == len(lab) >= 1
+        assert np.all(b[:, :2] >= 0) and np.all(b[:, 0] + b[:, 2] <= w + 1e-3) and np.all(b[:, 1] + b[:, 3] <= h + 1e-3)
+        assert np.all(b[:, 2:] > 2)
+
+
 def test_dataset_flip_mirrors_boxes(toy_coco, monkeypatch):
     ds = CocoDetection(*toy_coco, imgsz=(64, 64), augment=True)
     monkeypatch.setattr(random, "random", lambda: 0.0)  # always flip
@@ -56,6 +74,18 @@ def test_train_loop_saves_best_checkpoint(toy_coco, tmp_path):
     assert len(result.history) == 2 and all("AP" in h for h in result.history)
     state = torch.load(result.checkpoint, weights_only=False)
     assert state["class_names"] == ["other", "thing"]
+
+
+def test_train_without_validation_saves_checkpoint_even_with_large_loss(toy_coco, tmp_path):
+    class BigLoss(ToyDetector):
+        def loss(self, x, targets):
+            loss, parts = super().loss(x, targets)
+            return loss + 1000.0, parts  # -loss < -1: used to never be "best", no checkpoint written
+
+    ds = CocoDetection(*toy_coco, imgsz=(32, 32))
+    cfg = TrainConfig(epochs=1, batch=2, workers=0, device="cpu", log_every=100)
+    result = train(BigLoss(), ds, None, cfg, tmp_path / "run", "toy")
+    assert result.checkpoint.exists() and result.best_epoch == 0
 
 
 def test_collate_stacks_pixels_keeps_targets():

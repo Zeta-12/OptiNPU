@@ -34,6 +34,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "build", "ruff"]
+pretrained = ["timm"]  # ImageNet RepVGG-A0 backbone for OptiDet (MIT weights)
 
 [project.scripts]
 optinpu = "optinpu.cli:main"

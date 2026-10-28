@@ -1,4 +1,4 @@
-"""COCO val2017 subsets, downloaded on demand (annotations once, then only the needed images)."""
+"""COCO 2017 subsets, downloaded on demand (annotations once, then only the needed images)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 DEFAULT_ROOT = Path(os.environ.get("OPTINPU_DATA", Path.home() / ".cache" / "optinpu" / "coco"))
 ANNOTATIONS_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
 IMAGE_URL = "http://images.cocodataset.org/val2017/{file_name}"
+TRAIN_IMAGE_URL = "http://images.cocodataset.org/train2017/{file_name}"
 
 
 @dataclass
@@ -40,17 +41,65 @@ def _download(url: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def _full_val_annotations(root: Path) -> Path:
-    path = root / "annotations" / "instances_val2017.json"
+def _full_annotations(root: Path, split: str) -> Path:
+    path = root / "annotations" / f"instances_{split}2017.json"
     if not path.exists():
         archive = root / "annotations_trainval2017.zip"
         root.mkdir(parents=True, exist_ok=True)
         print(f"Downloading COCO annotations (~250 MB) to {archive}")
         _download(ANNOTATIONS_URL, archive)
         with zipfile.ZipFile(archive) as z:
-            z.extract("annotations/instances_val2017.json", root)
+            z.extract(f"annotations/instances_{split}2017.json", root)
         archive.unlink()
     return path
+
+
+def _full_val_annotations(root: Path) -> Path:
+    return _full_annotations(root, "val")
+
+
+def coco_train_subset(
+    num_images: int = 10000,
+    offset: int = 0,
+    root: str | Path = DEFAULT_ROOT,
+    workers: int = 16,
+) -> CocoSubset:
+    """Annotated train2017 images [offset, offset + num_images) sorted by id (crowd-only images kept).
+
+    The annotations file (~450 MB) is downloaded once; only the selected images are downloaded
+    (~160 KB each, about 1.6 GB for 10,000 images).
+    """
+    root = Path(root)
+    subset_json = root / "subsets" / f"train2017_{offset}_{num_images}.json"
+    image_dir = root / "train2017"
+    if subset_json.exists():
+        data = json.loads(subset_json.read_text())
+    else:
+        full = json.loads(_full_annotations(root, "train").read_text())
+        annotated = {a["image_id"] for a in full["annotations"]}
+        images = sorted((im for im in full["images"] if im["id"] in annotated), key=lambda im: im["id"])
+        images = images[offset: offset + num_images]
+        ids = {im["id"] for im in images}
+        data = {
+            "images": images,
+            "annotations": [a for a in full["annotations"] if a["image_id"] in ids],
+            "categories": full["categories"],
+        }
+        subset_json.parent.mkdir(parents=True, exist_ok=True)
+        subset_json.write_text(json.dumps(data))
+
+    image_dir.mkdir(parents=True, exist_ok=True)
+    missing = [im["file_name"] for im in data["images"] if not (image_dir / im["file_name"]).exists()]
+    if missing:
+        print(f"Downloading {len(missing)} COCO train images to {image_dir}")
+        with ThreadPoolExecutor(workers) as pool:
+            list(pool.map(lambda f: _download(TRAIN_IMAGE_URL.format(file_name=f), image_dir / f), missing))
+    return CocoSubset(
+        annotations=subset_json,
+        image_dir=image_dir,
+        image_ids=[im["id"] for im in data["images"]],
+        category_ids=sorted(c["id"] for c in data["categories"]),
+    )
 
 
 def coco_val_subset(

@@ -20,12 +20,14 @@ def quantize_int8(
     transformer: bool = True,
     ignored_types: Iterable[str] = (),
     ignored_patterns: Iterable[str] = (),
+    **nncf_options,
 ) -> Path:
     """Quantize an FP32/FP16 IR to INT8 and save it (activations INT8, weights INT8).
 
     `calibration` items (e.g. image paths) are turned into model inputs by `transform`.
     `transformer=True` uses NNCF's transformer scheme (keeps LayerNorm/Softmax inputs in float).
     `ignored_types` / `ignored_patterns` keep matching ops (OpenVINO op types / name regexes) in float.
+    `nncf_options` go to nncf.quantize (e.g. preset=nncf.QuantizationPreset.MIXED, fast_bias_correction=False).
     """
     import nncf
 
@@ -41,6 +43,7 @@ def quantize_int8(
         subset_size=subset_size,
         model_type=nncf.ModelType.TRANSFORMER if transformer else None,
         ignored_scope=ignored,
+        **nncf_options,
     )
     output = Path(output).with_suffix(".xml")
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -177,7 +177,8 @@ def train(
 
     val_subset = val_set.to_subset() if val_set is not None else None
 
-    result = TrainResult(best_ap=-1.0, best_epoch=-1, checkpoint=out_dir / "best.pt")
+    # -inf: without validation the score is -loss, which can be below any finite start value
+    result = TrainResult(best_ap=float("-inf"), best_epoch=-1, checkpoint=out_dir / "best.pt")
     step = 0
     print(f"Training {name} on {device}: {len(train_set)} images, {len(loader)} steps/epoch, {cfg.epochs} epochs")
     for epoch in range(cfg.epochs):

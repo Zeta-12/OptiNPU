@@ -29,12 +29,16 @@ class CocoDetection(torch.utils.data.Dataset):
         imgsz: tuple[int, int] = (640, 640),
         augment: bool = False,
         keep_empty: bool = False,
+        zoom: bool = False,
     ):
+        """`augment`: horizontal flip and color jitter; `zoom` adds scale augmentation (random_zoom),
+        recommended when training a detector from scratch (OptiDet)."""
         data = json.loads(Path(annotations).read_text())
         self.annotations = Path(annotations)
         self.image_dir = Path(image_dir)
         self.imgsz = imgsz
         self.augment = augment
+        self.zoom = zoom
         self.category_ids = sorted(c["id"] for c in data["categories"])
         names = {c["id"]: c["name"] for c in data["categories"]}
         self.class_names = [names[i] for i in self.category_ids]
@@ -74,6 +78,9 @@ class CocoDetection(torch.utils.data.Dataset):
         boxes = np.array([b for _, b in anns], dtype=np.float32).reshape(-1, 4)  # xywh pixels
 
         if self.augment:
+            if self.zoom:
+                image, boxes, labels = random_zoom(image, boxes, labels)
+                w, h = image.size
             if random.random() < 0.5:
                 image = image.transpose(Image.FLIP_LEFT_RIGHT)
                 boxes[:, 0] = w - boxes[:, 0] - boxes[:, 2]
@@ -95,6 +102,36 @@ class CocoDetection(torch.utils.data.Dataset):
             "image_id": info["id"],
         }
         return pixels, target
+
+
+def random_zoom(image: Image.Image, boxes: np.ndarray, labels: np.ndarray):
+    """Scale augmentation (boxes in xywh pixels): zoom-out with probability 0.3 (image on a canvas up to
+    2x larger, filled with the dataset mean color), then zoom-in with probability 0.5 (crop of 50-100% of
+    each side; boxes clipped, dropped when less than 30% of their area remains)."""
+    w, h = image.size
+    if random.random() < 0.3:
+        ratio = random.uniform(1.0, 2.0)
+        cw, ch = int(w * ratio), int(h * ratio)
+        ox, oy = random.randint(0, cw - w), random.randint(0, ch - h)
+        canvas = Image.new("RGB", (cw, ch), (124, 116, 104))
+        canvas.paste(image, (ox, oy))
+        image, w, h = canvas, cw, ch
+        boxes = boxes + np.array([ox, oy, 0, 0], dtype=np.float32)
+    if len(boxes) and random.random() < 0.5:
+        for _ in range(10):
+            cw, ch = int(w * random.uniform(0.5, 1.0)), int(h * random.uniform(0.5, 1.0))
+            x0, y0 = random.randint(0, w - cw), random.randint(0, h - ch)
+            x1 = np.clip(boxes[:, 0] - x0, 0, cw)
+            y1 = np.clip(boxes[:, 1] - y0, 0, ch)
+            x2 = np.clip(boxes[:, 0] + boxes[:, 2] - x0, 0, cw)
+            y2 = np.clip(boxes[:, 1] + boxes[:, 3] - y0, 0, ch)
+            keep = ((x2 - x1) * (y2 - y1) >= 0.3 * boxes[:, 2] * boxes[:, 3]) & (x2 - x1 > 2) & (y2 - y1 > 2)
+            if keep.any():
+                image = image.crop((x0, y0, x0 + cw, y0 + ch))
+                boxes = np.stack([x1, y1, x2 - x1, y2 - y1], 1)[keep].astype(np.float32)
+                labels = labels[keep]
+                break
+    return image, boxes, labels
 
 
 def collate(batch):

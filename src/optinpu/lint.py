@@ -41,6 +41,7 @@ class LintReport:
     issues: list[LintIssue] = field(default_factory=list)
     compiles: bool | None = None
     rel_error: float | None = None  # max relative error of outputs vs CPU FP32
+    agreement: float | None = None  # detection F1 vs CPU FP32 (Detector.lint with images)
     latency_ms: float | None = None
     recommended_config: dict = field(default_factory=dict)
 
@@ -54,6 +55,8 @@ class LintReport:
             lines.append(f"  compiles: {self.compiles}")
         if self.rel_error is not None:
             lines.append(f"  output error vs CPU FP32: {self.rel_error:.4f}")
+        if self.agreement is not None:
+            lines.append(f"  detection agreement with CPU FP32 (F1): {self.agreement:.3f}")
         if self.latency_ms is not None:
             lines.append(f"  latency: {self.latency_ms:.1f} ms")
         if self.recommended_config:
@@ -115,7 +118,9 @@ def _static_checks(model: ov.Model) -> list[LintIssue]:
         if op.get_type_name() == "MaxPool" and list(attrs.get("kernel", [])) == [2, 2] and list(attrs.get("strides", [])) == [1, 1]:
             maxpool_2x2s1.append(op.get_friendly_name())
     if ceil_pools:
-        issues.append(LintIssue("error", "POOL-CEIL", "ceil rounding in pooling makes the NPU compiler fail (npu_patches.FloorWhenExactPool)", ceil_pools))
+        # a warning, not an error: it fails for some shapes only (RT-DETRv2 ResNet-vd shortcuts) and
+        # compiles fine elsewhere (DEIMv2-N); the compile step below reports real failures
+        issues.append(LintIssue("warning", "POOL-CEIL", "ceil rounding in pooling can make the NPU compiler fail (npu_patches.FloorWhenExactPool)", ceil_pools))
     if maxpool_2x2s1:
         issues.append(LintIssue("warning", "MAXPOOL-2x2-S1", "MaxPool k2 s1 is mis-compiled when its input feeds a conv (npu_patches.MaxPool2x2s1)", maxpool_2x2s1))
 
@@ -135,7 +140,8 @@ def _static_checks(model: ov.Model) -> list[LintIssue]:
     if compute and heavy / compute < 0.25:
         issues.append(LintIssue(
             "info", "SMALL-OPS",
-            f"only {heavy}/{compute} ops are conv/matmul: the NPU is likely bound by per-op overhead, INT8 will not help much"))
+            f"only {heavy}/{compute} ops are conv/matmul: time likely goes to non-convolution ops (activations, "
+            "data movement, attention), where the NPU is slow and INT8 does not help (PLAN.md, M1)"))
     return issues
 
 
@@ -143,6 +149,42 @@ def _run(model: ov.Model, device: str, inputs, config=None):
     cfg = {"INFERENCE_PRECISION_HINT": "f32"} if device == "CPU" else dict(config or {})
     request = core().compile_model(model, device, cfg).create_infer_request()
     return list(request.infer(inputs).values()), request
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """IoU matrix between (N, 4) and (M, 4) xyxy boxes."""
+    lt = np.maximum(a[:, None, :2], b[None, :, :2])
+    rb = np.minimum(a[:, None, 2:], b[None, :, 2:])
+    inter = np.clip(rb - lt, 0, None).prod(-1)
+    area = lambda x: np.clip(x[:, 2:] - x[:, :2], 0, None).prod(-1)
+    return inter / (area(a)[:, None] + area(b)[None, :] - inter + 1e-9)
+
+
+def detection_agreement(reference: list, test: list, iou: float = 0.7, conf: float = 0.3) -> float:
+    """F1 between two runs' detections over all images: a detection (score >= conf) matches one of
+    the other run with the same class and IoU >= iou (greedy, by decreasing score). 1.0 = identical.
+
+    This is what matters for a detector, unlike raw output errors, which over-react to harmless FP16
+    noise (RF-DETR) and under-react to real drifts (YOLO26-N on 2 NPU tiles, PLAN.md M0)."""
+    matched = n_ref = n_test = 0
+    for ref, out in zip(reference, test):
+        keep_r, keep_t = ref.scores >= conf, out.scores >= conf
+        rb, rl = ref.boxes[keep_r], ref.labels[keep_r]
+        tb, tl, ts = out.boxes[keep_t], out.labels[keep_t], out.scores[keep_t]
+        n_ref, n_test = n_ref + len(rb), n_test + len(tb)
+        if not len(rb) or not len(tb):
+            continue
+        ious = _iou(tb, rb)
+        ious[tl[:, None] != rl[None, :]] = 0
+        used = np.zeros(len(rb), dtype=bool)
+        for i in np.argsort(-ts):
+            candidates = np.where(~used & (ious[i] >= iou))[0]
+            if len(candidates):
+                used[candidates[np.argmax(ious[i, candidates])]] = True
+                matched += 1
+    if n_ref + n_test == 0:
+        return 1.0
+    return 2 * matched / (n_ref + n_test)
 
 
 def lint(

@@ -68,9 +68,9 @@ def test_lint_flags_static_problems():
     pool = ops.max_pool(ceil_pool, [1, 1], [1, 1], [0, 0], [0, 0], [2, 2])  # k2 s1
     big = ops.multiply(pool.output(0), ops.constant(np.full((1,), 1e6, np.float32)))
     report = lint(ov.Model([big], [p]), device="cpu", check_accuracy=False)
-    codes = {i.code for i in report.issues}
-    assert {"POOL-CEIL", "MAXPOOL-2x2-S1", "FP16-RANGE"} <= codes
-    assert not report.ok
+    severities = {i.code: i.severity for i in report.issues}
+    assert severities["POOL-CEIL"] == severities["MAXPOOL-2x2-S1"] == severities["FP16-RANGE"] == "warning"
+    assert report.ok  # warnings only: real compile failures are reported by the compile step
 
 
 def test_lint_shape_subgraph_only_flags_float_values():
@@ -88,6 +88,24 @@ def test_lint_shape_subgraph_only_flags_float_values():
     out = ops.add(p, pos)
     report = lint(ov.Model([out], [p]), device="cpu", check_accuracy=False)
     assert "SHAPE-SUBGRAPH" in {i.code for i in report.issues}
+
+
+def test_detection_agreement():
+    from optinpu.lint import detection_agreement
+    from optinpu.postprocess import Detections
+
+    def dets(boxes, labels, scores):
+        return Detections(np.array(boxes, np.float32), np.array(scores, np.float32), np.array(labels), ["a", "b"])
+
+    ref = [dets([[0, 0, 10, 10], [20, 20, 40, 40]], [0, 1], [0.9, 0.8])]
+    assert detection_agreement(ref, ref) == 1.0
+    shifted = [dets([[0, 0, 10, 10], [25, 25, 45, 45]], [0, 1], [0.9, 0.8])]  # 2nd box IoU 0.39
+    assert detection_agreement(ref, shifted) == 0.5
+    wrong_class = [dets([[0, 0, 10, 10], [20, 20, 40, 40]], [0, 0], [0.9, 0.8])]
+    assert detection_agreement(ref, wrong_class) == 0.5
+    low_score = [dets([[0, 0, 10, 10], [20, 20, 40, 40]], [0, 1], [0.9, 0.1])]  # below conf: not counted
+    assert detection_agreement(ref, low_score) == 2 / 3
+    assert detection_agreement([dets(np.zeros((0, 4)), [], [])], [dets(np.zeros((0, 4)), [], [])]) == 1.0
 
 
 def test_lint_dynamic_input_is_an_error():

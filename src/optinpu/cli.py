@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
     n.add_argument("--image", help="real input for the accuracy check (default: noise)")
     n.add_argument("--device", default="npu")
     n.add_argument("--raw", action="store_true", help="ignore the model's known NPU config")
+    n.add_argument("--images", type=int, default=0,
+                   help="judge accuracy on detections over the first N COCO val2017 images (recommended: 30)")
 
     f = sub.add_parser("profile", help="per-layer time on a device")
     f.add_argument("model")
@@ -128,7 +130,12 @@ def main(argv: list[str] | None = None) -> None:
         else:
             from optinpu import Detector
 
-            report = Detector(args.model).lint(args.image, args.device, raw=args.raw)
+            images = None
+            if args.images:
+                from optinpu.data import coco_val_subset
+
+                images = coco_val_subset(args.images).image_paths()
+            report = Detector(args.model).lint(args.image, args.device, raw=args.raw, images=images)
         print(report)
         raise SystemExit(0 if report.ok else 1)
     elif args.command == "profile":

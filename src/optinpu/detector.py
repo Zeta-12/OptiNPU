@@ -19,6 +19,8 @@ from optinpu.runtime import CompiledModel, HybridModel, compile_hybrid, compile_
 if TYPE_CHECKING:
     from optinpu.engine import TrainResult
 
+TRAINING_ONLY_PREFIXES = ("distill.",)  # checkpoint entries that inference models do not have
+
 
 class Detector:
     """Object detector that trains in PyTorch and runs on CPU, GPU or NPU through OpenVINO.
@@ -55,7 +57,11 @@ class Detector:
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         detector = cls(name, pretrained=False, class_names=state["class_names"],
                        workdir=workdir or checkpoint.parent.parent)
-        detector.model.load_state_dict(state["state_dict"])
+        weights = state["state_dict"]
+        expected = detector.model.state_dict().keys()
+        # training-only modules (e.g. OptiDet distillation adapters) are not part of the inference model
+        training_only = {k for k in weights if k not in expected and k.startswith(TRAINING_ONLY_PREFIXES)}
+        detector.model.load_state_dict({k: v for k, v in weights.items() if k not in training_only})
         detector.model.eval()
         detector.workdir = Path(workdir) if workdir else checkpoint.parent
         return detector
@@ -203,17 +209,47 @@ class Detector:
                 results.append(benchmark(ir, d, config=self._device_config(d), **kwargs))
         return results
 
-    def lint(self, image=None, device: str = "npu", precision: str = "fp16", raw: bool = False):
-        """npu_lint report for the exported IR. `image` makes the accuracy check meaningful
-        (default: noise). `raw=True` ignores the model's known-good NPU config, to re-check it."""
-        from optinpu.lint import lint
+    def lint(self, image=None, device: str = "npu", precision: str = "fp16", raw: bool = False,
+             images=None, min_agreement: float = 0.95):
+        """npu_lint report for the exported IR. `raw=True` ignores the model's known-good NPU config.
+
+        With `images` (a list of image sources), accuracy is judged on the detections: F1 agreement
+        between CPU FP32 and `device` (optinpu.lint.detection_agreement) must reach `min_agreement`;
+        otherwise NPU_TILES=1 is tried and recommended when it fixes it. Without `images`, the raw
+        output error on `image` (default: noise) is used, which is less reliable.
+        """
+        from optinpu.lint import LintIssue, detection_agreement, lint
 
         ir = self.export(precision=precision)
         inputs = None
         if image is not None:
             inputs = [preprocess(load_image(image), self.spec.imgsz, self.spec.mean, self.spec.std)]
         config = None if raw else self._device_config(device)
-        return lint(ir, device, inputs, config=config)
+        report = lint(ir, device, inputs, config=config, check_accuracy=images is None)
+        if images is None or not report.compiles:
+            return report
+
+        loaded = [load_image(src) for src in images]
+
+        def detections(dev, cfg):
+            model = compile_model(ir, dev, config=cfg, cache_dir=None)
+            out = []
+            for img in loaded:
+                scores, boxes = model(preprocess(img, self.spec.imgsz, self.spec.mean, self.spec.std))
+                out.append(decode(scores[0], boxes[0], img.size, self.class_names, conf=0.0))
+            return out
+
+        reference = detections("cpu", {"INFERENCE_PRECISION_HINT": "f32"})
+        report.agreement = detection_agreement(reference, detections(device, config))
+        if report.agreement < min_agreement:
+            message = f"detections agree with CPU FP32 at F1 {report.agreement:.3f} (< {min_agreement})"
+            if device.lower() == "npu" and not (config or {}).get("NPU_TILES"):
+                one_tile = detection_agreement(reference, detections(device, {**(config or {}), "NPU_TILES": 1}))
+                if one_tile >= min_agreement:
+                    report.recommended_config = {"NPU_TILES": 1}
+                    message += f"; with NPU_TILES=1: {one_tile:.3f}"
+            report.issues.append(LintIssue("error", "ACCURACY", message))
+        return report
 
     def benchmark_stages(self, device: str = "npu", precision: str = "fp16") -> dict[str, float]:
         """Real latency of cumulative stages (e.g. backbone, +encoder, full) in ms."""

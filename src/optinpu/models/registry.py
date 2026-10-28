@@ -8,6 +8,7 @@ This contract keeps decoding identical across PyTorch, CPU, GPU and NPU.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -173,6 +174,31 @@ for _name, _repo, _npu_config in (
         name=_name, builder=_hf_detr(_repo), source=f"hf:{_repo}", npu_config=_npu_config,
         stages=HF_DETR_STAGES, split=HF_DETR_SPLIT,
     ))
+
+
+def _optidet(**overrides) -> Callable[..., nn.Module]:
+    def build(pretrained: bool, class_names: list[str] | None = None) -> nn.Module:
+        """pretrained=True: ImageNet RepVGG-A0 backbone (no detection weights exist yet)."""
+        from optinpu.models.optidet import OptiDet, OptiDetConfig, load_repvgg_a0
+
+        cfg = OptiDetConfig(**overrides)
+        if class_names is not None:
+            cfg = dataclasses.replace(cfg, num_classes=len(class_names))
+        model = OptiDet(cfg)
+        if pretrained:
+            load_repvgg_a0(model.backbone)
+        return model
+
+    return build
+
+
+# OptiDet-N prototype (M2): RepVGG-A0 backbone, neck/head width 64, 416 px: 3.38 ms on the NPU in
+# INT8 with 2 tiles (benchmarks/m2). "pretrained" = ImageNet backbone only; train it before use.
+register(ModelSpec(
+    name="optidet-n", imgsz=(416, 416), source="optinpu (prototype, RepVGG-A0 ImageNet backbone)",
+    builder=_optidet(widths=(48, 48, 96, 192, 384), depths=(1, 2, 4, 14, 1), neck_width=64, head_width=64,
+                     imgsz=(416, 416)),
+))
 
 
 def list_models() -> list[str]:
