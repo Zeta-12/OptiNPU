@@ -101,6 +101,28 @@ the outside.
 
 Compile with `{"NPU_TILES": 1}` (about 41 ms instead of 33 ms per inference for this model).
 
+## Update (2026-10-29): the selection tail is involved
+
+- **Moving the end-to-end selection out of the NPU graph removes the hang.** We split the IR right
+  before the first `TopK` of `/model.23`: the 16 ops that depend on it (`TopK` ×2,
+  `GatherElements` ×3, `Divide`, `FloorMod`, `Broadcast`, `Concat`…) run on the CPU, everything else
+  on the NPU with default (2-tile) compilation. 500 consecutive COCO val2017 images run without any
+  error, with detections identical to CPU FP32 (AP 50.7 vs 50.8 on those images), at 15.7 ms per
+  inference instead of 32.6 ms for the full graph on 2 tiles.
+- **The tail alone does not hang**: compiled alone on the NPU (2 tiles), fed with the head outputs
+  of 30 real images, it runs fine. The hang needs the tail compiled together with the rest of the
+  network.
+- **A modified YOLO26-N also hangs**: with the head's `Sigmoid` bypassed (an experiment of our
+  profiler; the graph is otherwise unchanged), YOLO26-N loses the device in the same way within the
+  first inferences on random inputs, whereas the original YOLO26-N does not. The values reaching
+  the selection seem to matter.
+- **The same split also fixes the silent accuracy drop of YOLO26-N** (next section): AP 44.8 with
+  the tail on the CPU and 2 NPU tiles, vs 40.7 with the full graph on 2 tiles and 44.8 on CPU
+  (val2017 images [0, 500)). The multi-tile accuracy issue of YOLO26-N is in the selection tail too.
+- Vendor counters (`PERF_COUNT`) put most of YOLO26-N's NPU time in that tail, on SHAVE: one
+  `Divide` ~19.5 ms and one `GatherElements` ~15.4 ms (cumulative task times), for a 25.9 ms
+  inference. That cost alone may deserve a look.
+
 ## Related observation (possibly a separate issue)
 
 With default (multi-tile) compilation, several models also produce **degraded results without any

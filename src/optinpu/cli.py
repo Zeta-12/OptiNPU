@@ -1,4 +1,5 @@
-"""Command line interface: optinpu devices | models | predict | bench | export | eval | train | qat | lint | profile."""
+"""Command line interface: optinpu devices | models | predict | bench | export | eval | train | qat | lint |
+profile | optimize."""
 
 from __future__ import annotations
 
@@ -69,10 +70,29 @@ def main(argv: list[str] | None = None) -> None:
                    help="judge accuracy on detections over the first N COCO val2017 images (recommended: 30)")
 
     f = sub.add_parser("profile", help="per-layer time on a device")
-    f.add_argument("model")
+    f.add_argument("model", help="registered model name, or path to an OpenVINO .xml / ONNX file")
     f.add_argument("--device", default="npu")
     f.add_argument("--precision", default="fp16", choices=["fp32", "fp16", "int8"])
     f.add_argument("--top", type=int, default=15)
+    f.add_argument("--measured", action="store_true",
+                   help="measured profile: latency saved by bypassing each region / op type (slower, exact)")
+
+    o = sub.add_parser("optimize", help="measured rewrites that cut NPU latency without accuracy loss")
+    o.add_argument("model", help="registered model name, or path to an OpenVINO .xml / ONNX file")
+    o.add_argument("--images", help="folder of sample images for the accuracy guard (detectors); "
+                                    "without it, raw outputs on random inputs are compared")
+    o.add_argument("--samples", type=int, default=30, help="guard images taken from --images")
+    o.add_argument("--calibration", help="folder of images for INT8 calibration (300 used; default: the guard images)")
+    o.add_argument("--annotations", nargs=2, metavar=("JSON", "IMAGES"),
+                   help="COCO-format set judging INT8 and repairs by AP (not the images you report on)")
+    o.add_argument("--ap-budget", type=float, default=0.5, help="AP points an approximate rewrite may cost")
+    o.add_argument("--no-int8", action="store_true", help="do not try INT8 quantization")
+    o.add_argument("--task", default="optinpu", choices=["optinpu", "detr", "dets"],
+                   help="output format of a detector given as a file")
+    o.add_argument("--letterbox", action="store_true", help="YOLO-style pre-processing (file models)")
+    o.add_argument("--imagenet-norm", action="store_true", help="ImageNet mean / std normalization (file models)")
+    o.add_argument("--min-agreement", type=float, default=0.95)
+    o.add_argument("--out", help="write report.md, report.json and the optimized deployment (part*.xml) here")
 
     args = parser.parse_args(argv)
 
@@ -160,11 +180,60 @@ def main(argv: list[str] | None = None) -> None:
         print(report)
         raise SystemExit(0 if report.ok else 1)
     elif args.command == "profile":
-        from optinpu import Detector
-        from optinpu.profile import format_profile, profile
+        ir = _model_file(args.model, args.precision)
+        if args.measured:
+            from optinpu.profiler import profile_measured
 
-        ir = Detector(args.model).export(precision=args.precision)
-        print(format_profile(profile(ir, args.device), top=args.top))
+            print(profile_measured(ir, args.device))
+        else:
+            from optinpu.profile import format_profile, profile
+
+            print(format_profile(profile(ir, args.device), top=args.top))
+    elif args.command == "optimize":
+        from pathlib import Path
+
+        from optinpu.export import load_model
+        from optinpu.optimizer import optimize
+        from optinpu.tasks import DetectionTask, OutputTask, random_samples
+
+        model = load_model(_model_file(args.model, "fp16"))
+        images = lambda folder, n: sorted(p for p in Path(folder).iterdir()
+                                          if p.suffix.lower() in (".jpg", ".jpeg", ".png"))[:n]
+        evaluation = None
+        if args.images:
+            shape = model.inputs[0].get_partial_shape().to_shape()
+            if Path(args.model).suffix in (".xml", ".onnx"):
+                imagenet = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) if args.imagenet_norm else (None, None)
+                task = DetectionTask((shape[2], shape[3]), args.task, "letterbox" if args.letterbox else "stretch",
+                                     *imagenet)
+            else:
+                from optinpu import Detector
+
+                task = Detector(args.model).task
+            samples = images(args.images, args.samples)
+            if args.annotations:
+                from optinpu.data import CocoDetection
+
+                evaluation = CocoDetection(args.annotations[0], args.annotations[1], task.imgsz).to_subset()
+        else:
+            task, samples = OutputTask(), random_samples(model, args.samples)
+        calibration = images(args.calibration, 300) if args.calibration else None
+        report = optimize(model, task, samples, min_agreement=args.min_agreement, calibration=calibration,
+                          evaluation=evaluation, ap_budget=args.ap_budget / 100, int8=not args.no_int8)
+        print(report)
+        if args.out:
+            print(f"\nreport and optimized deployment written to {report.save(args.out, f'{args.model} on the NPU')}")
+
+
+def _model_file(model: str, precision: str) -> str:
+    """A model file as given, or the IR of a registered model (exported on demand)."""
+    from pathlib import Path
+
+    if Path(model).suffix in (".xml", ".onnx"):
+        return model
+    from optinpu import Detector
+
+    return str(Detector(model).export(precision=precision))
 
 
 if __name__ == "__main__":

@@ -48,6 +48,13 @@ class Baseline:
     def onnx(self) -> Path:
         return ONNX_DIR / f"{self.name}.onnx"
 
+    @property
+    def task(self):
+        """Pre / post-processing of the IR, as an optinpu.tasks.DetectionTask."""
+        from optinpu.tasks import DetectionTask
+
+        return DetectionTask(self.imgsz, self.output, self.resize, self.mean, self.std, self.class_columns)
+
 
 # COCO category ids of the 80 classes, in contiguous order (RF-DETR predicts 91 columns indexed by id)
 COCO_IDS = [

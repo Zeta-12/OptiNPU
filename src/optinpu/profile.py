@@ -20,14 +20,16 @@ class LayerTime:
     ms: float
 
 
-def profile(model: str | Path | ov.Model, device: str = "npu", iterations: int = 20) -> list[LayerTime]:
+def profile(model: str | Path | ov.Model, device: str = "npu", iterations: int = 20,
+            config: dict | None = None) -> list[LayerTime]:
     """Average per-layer execution time over `iterations`, sorted slowest first.
 
     Names and types are those reported by the device plugin: they may be fused or renamed
     compared to the IR (e.g. the NPU reports its own task names).
     """
     ov_device = normalize_ov_device(device)
-    compiled = core().compile_model(model, ov_device, {"PERF_COUNT": True, "PERFORMANCE_HINT": "LATENCY"})
+    compiled = core().compile_model(model, ov_device,
+                                    {"PERF_COUNT": True, "PERFORMANCE_HINT": "LATENCY", **(config or {})})
     request = compiled.create_infer_request()
     rng = np.random.default_rng(0)
     inputs = [rng.random(tuple(i.get_shape()), dtype=np.float32) for i in compiled.inputs]

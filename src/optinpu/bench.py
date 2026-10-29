@@ -39,7 +39,8 @@ def benchmark(
     throughput_seconds: float = 3.0,
     config: dict | None = None,
 ) -> BenchResult:
-    """Measure batch-1 latency (LATENCY hint) and max throughput (THROUGHPUT hint, async queue)."""
+    """Measure batch-1 latency (LATENCY hint) and max throughput (THROUGHPUT hint, async queue).
+    `throughput_seconds=0` skips the throughput run (one compilation less): fps is then 1000 / median."""
     ov_device = normalize_ov_device(device)
     if isinstance(model, (str, Path)):
         model = core().read_model(model)
@@ -57,6 +58,9 @@ def benchmark(
         t = time.perf_counter()
         request.infer(inputs)
         times.append((time.perf_counter() - t) * 1e3)
+    median = float(np.median(times))
+    if throughput_seconds <= 0:
+        return BenchResult(ov_device, compile_s, median, float(np.percentile(times, 90)), 1e3 / median)
 
     tput_model = compile_model(model, ov_device, hint="THROUGHPUT", config=config)
     queue = ov.AsyncInferQueue(tput_model.compiled)
@@ -72,7 +76,7 @@ def benchmark(
     return BenchResult(
         device=ov_device,
         compile_s=compile_s,
-        latency_ms_median=float(np.median(times)),
+        latency_ms_median=median,
         latency_ms_p90=float(np.percentile(times, 90)),
         throughput_fps=fps,
     )

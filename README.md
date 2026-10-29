@@ -21,6 +21,61 @@ optinpu eval dfine-n --devices cpu,npu --precisions fp16,int8 --images 500
 optinpu profile dfine-n --device npu
 ```
 
+## Profile and optimize your own model for the NPU
+
+Bring any model (OpenVINO IR, ONNX or PyTorch). `optinpu` measures where its NPU latency goes, checks
+that the NPU computes the right thing, and applies the changes that make it faster without losing
+accuracy. Every number is a measurement on the device, never an estimate.
+
+```
+optinpu profile yolo26n.xml --measured
+optinpu optimize yolo26n.xml --task dets --letterbox --images guard_images/ \
+    --annotations instances.json images/ --calibration calib_images/ --out yolo26n_npu/
+```
+
+```python
+from optinpu import optimize
+from optinpu.data import CocoDetection
+from optinpu.optimizer import load_deployment
+from optinpu.tasks import Deployed, DetectionTask
+
+task = DetectionTask((640, 640), output="dets", resize="letterbox")   # how to feed / decode the model
+report = optimize("yolo26n.xml", task, guard_images, calibration=calib_images,
+                  evaluation=CocoDetection("instances.json", "images/").to_subset(), ap_budget=0.005)
+print(report)                       # 25.9 ms -> 8.5 ms (3.0x), AP 44.8 = CPU FP32 (YOLO26-N)
+report.save("yolo26n_npu/")         # report.md, report.json, the optimized deployment (part*.xml)
+model = Deployed(load_deployment("yolo26n_npu/"), task)
+model.predict("image.jpg")
+```
+
+**Profiler** (`profile_measured`, `optinpu profile --measured`). For each module region and each op type,
+the latency saved when it is bypassed, measured in paired, randomized rounds until the 95 % confidence
+interval is narrow. The NPU's own counters overlap (they sum to 3-10x the real latency) and an additive
+per-op cost model ignores fusions: on 6 models, acting on their first pick loses 26 % and 40 % of the
+best possible saving, against 0 % for the measured profile.
+
+**Optimizer** (`optimize`, `optinpu optimize`). A greedy loop over measured candidates, each checked for
+accuracy against the CPU FP32 original (detection F1 on guard images, or COCO AP on an annotated set):
+
+| Kind | Rewrites |
+|---|---|
+| exact | final selection (TopK / NMS and after) on the CPU; DETR decoder on the iGPU / CPU; NPU tiles; depthwise as dense conv |
+| approximate (AP budget) | INT8 post-training quantization (both NNCF schemes); latency-guided mixed precision when full INT8 misses the budget |
+| retraining (reported) | SiLU / GELU -> ReLU, LayerNorm -> BatchNorm, 50-75 % weight pruning: latency measured before any training |
+
+Models that are wrong or crash on the NPU (e.g. YOLO26-S losing the device on 2 tiles) are repaired
+first. Every compilation and inference runs in a watched child process (`optinpu.sandbox`): a compiler
+using 50 GB or a lost NPU cannot take your process down.
+
+Results on this machine (Core Ultra 5 235U, NPU 3720; AP on COCO val2017 [0, 500), decisions taken on
+other images):
+
+| Model | Before | After | Applied | AP CPU / before / after |
+|---|---|---|---|---|
+| YOLO26-N | 25.9 ms | **8.5 ms** | selection on the CPU | 44.8 / 40.7 / 44.8 |
+| YOLO26-S | 33.0 ms, loses the NPU | **13.7 ms** | selection on the CPU + mixed INT8 | 50.8 / - / 50.6 |
+| D-FINE-N | 25.4 ms | **15.0 ms** | decoder on the iGPU | 45.8 / 45.6 / 45.6 |
+
 ## Training
 
 ```python
@@ -151,6 +206,6 @@ tile is exact but slower; `npu+gpu` is both exact and the fastest.
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest       # 55 tests, ~25 s; NPU tests are skipped without an NPU
+.venv\Scripts\python -m pytest       # 87 tests, ~45 s; NPU tests are skipped without an NPU
 .venv\Scripts\ruff check src tests examples
 ```

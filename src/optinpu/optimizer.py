@@ -1,0 +1,445 @@
+"""Measured optimizer: apply the rewrites that cut latency on the device without hurting accuracy.
+
+Greedy loop over a deployment state (graph, compile options, placement of the selection tail):
+1. the reference is the original model on the CPU in FP32; the state's accuracy is the task agreement
+   with it on the given samples (detections F1 for detectors, calibrated in PLAN.md M2.1);
+2. every candidate derived from the state is timed side by side with it (one sandboxed process); its
+   saving is paired per round with the state, repeated until its 95 % confidence interval is narrow;
+3. candidates are checked for accuracy, largest saving first (sandboxed: a lost NPU is a rejection);
+   the first that keeps the agreement above `min_agreement` and saves at least 1 % of the latency,
+   above zero with 95 % confidence, is applied;
+4. repeat until nothing helps. A state that is inexact on the device (e.g. YOLO26-N on 2 NPU tiles,
+   or YOLO26-S losing the NPU) accepts any exact candidate, even a slower one: correctness first. With
+   an annotated `evaluation` set, "exact" also requires the AP to stay within `ap_budget`.
+Approximate candidates (INT8 post-training quantization) change the function on purpose: with an
+annotated `evaluation` set, they are judged by their AP against the CPU FP32 reference (`ap_budget`);
+without one, by the same agreement threshold as exact candidates.
+Retrain-tier rewrites are then timed on the final state and reported as recommendations.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import openvino as ov
+
+from optinpu.devices import core
+from optinpu.graph import split_from
+from optinpu.profiler import Adaptive, measure, paired_saving
+from optinpu.rewrites import (
+    choose_float_groups,
+    depthwise_to_dense,
+    graph_rewrites,
+    int8_ptq,
+    quantizable_groups,
+    selection_tail,
+    split_group,
+)
+
+
+@dataclass
+class State:
+    """A deployment of the model: graph, compile options, and where the selection tail runs."""
+
+    model: ov.Model
+    config: dict | None = None
+    offload: str | None = None  # device of everything after the first TopK / NMS, or None
+    changes: list[str] = field(default_factory=list)
+
+    def parts(self, device: str = "npu") -> list:
+        if self.offload is None:
+            return [(self.model, device, self.config)]
+        roots, _, _ = selection_tail(self.model)
+        head, tail = split_from(self.model, roots)
+        return [(head, device, self.config), (tail, self.offload, None)]
+
+    def label(self) -> str:
+        return " + ".join(self.changes) or "original"
+
+    def save(self, directory: str | Path, device: str = "npu") -> Path:
+        """Write the deployment: one IR per part (part0.xml on the device, part1.xml for an offloaded
+        tail) and deployment.json (devices, compile options, changes). Load it with load_deployment."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        parts = []
+        for i, (model, part_device, config) in enumerate(self.parts(device)):
+            ov.save_model(model, directory / f"part{i}.xml", compress_to_fp16=True)
+            parts.append({"ir": f"part{i}.xml", "device": part_device, "config": config})
+        (directory / "deployment.json").write_text(json.dumps({"changes": self.changes, "parts": parts}, indent=1))
+        return directory
+
+
+def load_deployment(directory: str | Path) -> list[tuple[Path, str, dict | None]]:
+    """Parts [(IR path, device, config)] of a deployment written by OptimizationReport.save: pass them to
+    optinpu.tasks.Deployed (predictions) or optinpu.profiler.measure (latency)."""
+    directory = Path(directory)
+    spec = json.loads((directory / "deployment.json").read_text())
+    return [(directory / p["ir"], p["device"], p["config"]) for p in spec["parts"]]
+
+
+@dataclass
+class Trial:
+    label: str
+    kind: str
+    latency_ms: float
+    agreement: float | None = None
+    accepted: bool = False
+    note: str = ""
+    ap: float | None = None  # on the evaluation set, approx candidates only
+
+
+@dataclass
+class OptimizationReport:
+    device: str
+    baseline_ms: float
+    baseline_agreement: float
+    final: State
+    final_ms: float
+    final_agreement: float
+    trials: list[Trial] = field(default_factory=list)
+    recommendations: list[Trial] = field(default_factory=list)
+    reference_ap: float | None = None  # CPU FP32 original, on the evaluation set
+    baseline_ap: float | None = None  # original on the device
+    final_ap: float | None = None
+
+    def __str__(self) -> str:
+        speedup = self.baseline_ms / self.final_ms if self.final_ms else float("nan")
+        lines = [f"optimized for {self.device}: {self.baseline_ms:.2f} ms -> {self.final_ms:.2f} ms ({speedup:.2f}x), "
+                 f"agreement with CPU FP32 {self.baseline_agreement:.3f} -> {self.final_agreement:.3f}"]
+        if self.reference_ap is not None:
+            fmt = lambda ap: "failed" if ap is None else f"{ap:.3f}"
+            lines.append(f"AP on the evaluation set: CPU FP32 {fmt(self.reference_ap)}, original on {self.device} "
+                         f"{fmt(self.baseline_ap)}, optimized {fmt(self.final_ap)}")
+        lines += [f"applied: {self.final.label()}", "", "trials:"]
+        for t in self.trials:
+            agreement = "  -  " if t.agreement is None else f"{t.agreement:.3f}"
+            ap = "" if t.ap is None else f"  AP {t.ap:.3f}"
+            mark = "ACCEPTED" if t.accepted else ""
+            lines.append(f"  {t.label[:56]:<56} {t.latency_ms:7.2f} ms  agreement {agreement}{ap}  {mark} {t.note}")
+        if self.recommendations:
+            lines += ["", "with retraining (latency measured, accuracy to recover by fine-tuning):"]
+            for t in self.recommendations:
+                lines.append(f"  {t.label[:56]:<56} {t.latency_ms:7.2f} ms ({100 * (t.latency_ms / self.final_ms - 1):+.1f} %)"
+                             f"  {t.note}")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {"device": self.device, "applied": self.final.changes, "baseline_ms": self.baseline_ms,
+                "final_ms": self.final_ms, "speedup": self.baseline_ms / self.final_ms,
+                "baseline_agreement": self.baseline_agreement, "final_agreement": self.final_agreement,
+                "ap": {"cpu_fp32": self.reference_ap, "baseline": self.baseline_ap, "final": self.final_ap},
+                "trials": [dataclasses.asdict(t) for t in self.trials],
+                "recommendations": [dataclasses.asdict(t) for t in self.recommendations]}
+
+    def to_markdown(self, title: str = "Optimization report") -> str:
+        fmt = lambda v, spec=".3f": "—" if v is None else format(v, spec)
+        speedup = self.baseline_ms / self.final_ms
+        md = [f"# {title}", "",
+              f"**{self.baseline_ms:.2f} ms → {self.final_ms:.2f} ms on the {self.device.upper()} ({speedup:.2f}×)**, "
+              f"applied: {', '.join(f'`{c}`' for c in self.final.changes) or 'nothing'}.", "",
+              "| | Latency | Agreement with CPU FP32 | AP (evaluation set) |", "|---|---|---|---|",
+              f"| CPU FP32 reference | — | 1.000 | {fmt(self.reference_ap)} |",
+              f"| Original on the {self.device.upper()} | {self.baseline_ms:.2f} ms | {self.baseline_agreement:.3f} | "
+              f"{fmt(self.baseline_ap)} |",
+              f"| **Optimized** | **{self.final_ms:.2f} ms** | **{self.final_agreement:.3f}** | **{fmt(self.final_ap)}** |",
+              "", "## Candidates tried", "",
+              "| Candidate | Kind | Latency | Agreement | AP | Decision |", "|---|---|---|---|---|---|"]
+        for t in self.trials:
+            decision = "**accepted**" if t.accepted else t.note.replace("|", "/")
+            latency = "—" if not np.isfinite(t.latency_ms) else f"{t.latency_ms:.2f} ms"
+            md.append(f"| {t.label} | {t.kind} | {latency} | {fmt(t.agreement)} | {fmt(t.ap)} | {decision} |")
+        if self.recommendations:
+            md += ["", "## With retraining", "",
+                   "Latency measured on the optimized deployment; accuracy must be recovered by fine-tuning.", "",
+                   "| Change | Latency | vs optimized | Details |", "|---|---|---|---|"]
+            for t in self.recommendations:
+                md.append(f"| {t.label} | {t.latency_ms:.2f} ms | {100 * (t.latency_ms / self.final_ms - 1):+.1f} % | "
+                          f"{t.note.replace('|', '/')} |")
+        md += ["", "Latencies are medians of paired, randomized rounds (95 % confidence intervals in the details); "
+                   "agreement is the task's agreement with the CPU FP32 original on the guard samples."]
+        return "\n".join(md) + "\n"
+
+    def save(self, directory: str | Path, title: str = "Optimization report") -> Path:
+        """report.md, report.json and the optimized deployment (deployment.json, part*.xml) in `directory`."""
+        directory = Path(directory)
+        self.final.save(directory, self.device)
+        (directory / "report.md").write_text(self.to_markdown(title), encoding="utf-8")
+        (directory / "report.json").write_text(json.dumps(self.to_dict(), indent=1, default=str))
+        return directory
+
+
+TRANSFORMER_OPS = {"Softmax", "MVN", "ScaledDotProductAttention"}
+
+
+def _neighbours(state: State, int8=None) -> list[tuple[State, str, str]]:
+    """(state, kind, description) one change away from `state`. int8: function (graph, transformer) ->
+    INT8 graph (None: no quantization candidate). Both NNCF schemes are tried on graphs with attention or
+    LayerNorm: the measurements decide (on YOLO26 the transformer scheme makes a FakeQuantize the NPU
+    compiler rejects, PLAN.md P3.1)."""
+    out = []
+    if int8 is not None and not any(c.startswith("int8") for c in state.changes):
+        kinds = {op.get_type_name() for op in state.model.get_ordered_ops()}
+        for transformer in ((False, True) if kinds & TRANSFORMER_OPS else (False,)):
+            name = "int8-transformer" if transformer else "int8"
+            scheme = "transformer scheme" if transformer else "CNN scheme"
+            out.append((dataclasses.replace(state, model=int8(state.model, transformer),
+                                            changes=[*state.changes, name]),
+                        "approx", f"INT8 post-training quantization (NNCF, {scheme})"))
+    tiles = 2 if (state.config or {}).get("NPU_TILES") == 1 else 1
+    out.append((dataclasses.replace(state, config={**(state.config or {}), "NPU_TILES": tiles},
+                                    changes=[*state.changes, f"tiles={tiles}"]), "exact", f"NPU_TILES={tiles}"))
+    if state.offload is None:
+        found = selection_tail(state.model)
+        if found is not None:
+            _, n_ops, heavy = found
+            for device in (["cpu"] if heavy == 0 else ["gpu", "cpu"]):
+                what = "selection" if heavy == 0 else "decoder"
+                out.append((dataclasses.replace(state, offload=device, changes=[*state.changes, f"{what}-to-{device}"]),
+                            "exact", f"{n_ops} ops after the first TopK / NMS on the {device.upper()}"))
+    dense, n = depthwise_to_dense(state.model)
+    if n:
+        out.append((dataclasses.replace(state, model=dense, changes=[*state.changes, "depthwise-to-dense"]),
+                    "exact", f"{n} depthwise convolutions as dense"))
+    return out
+
+
+def optimize(
+    model,
+    task,
+    samples: list,
+    device: str = "npu",
+    config: dict | None = None,
+    min_agreement: float = 0.95,
+    calibration: list | None = None,
+    evaluation=None,
+    ap_budget: float = 0.005,
+    int8: bool = True,
+    sensitivity_samples: int = 64,
+    max_steps: int = 5,
+    recommend: bool = True,
+    rounds: int = 5,
+    iterations: int = 30,
+    log=print,
+) -> OptimizationReport:
+    """Optimize `model` (ov.Model or IR path) for `device`; see the module docstring.
+
+    samples: image sources (detection) or lists of input arrays (OutputTask), 30 or more recommended.
+    calibration: samples for INT8 quantization (default: `samples`; ideally 300, disjoint from them).
+    evaluation: an annotated optinpu.data.CocoSubset (detectors): approximate candidates must keep the AP
+    within `ap_budget` (0.005 = 0.5 AP point) of the CPU FP32 original on it, and the original or a
+    repair must stay within it to count as exact. Use images that are not those you report results on.
+    int8: try INT8 post-training quantization; sensitivity_samples: calibration samples used to rank the
+    module groups of a mixed precision search (the final mix uses all of `calibration`).
+    """
+    from optinpu.sandbox import run_evaluation, run_predictions
+
+    if not isinstance(model, ov.Model):
+        model = core().read_model(model)
+    reference, job = run_predictions([(model, "cpu", None)], task, samples)
+    if reference is None:
+        raise RuntimeError(f"reference run on the CPU failed: {job.error}")
+
+    def accuracy(state: State) -> tuple[float | None, str]:
+        predictions, job = run_predictions(state.parts(device), task, samples)
+        if predictions is None:
+            return None, ("NPU lost" if job.device_lost else "failed") + f": {(job.error or '')[-120:]}"
+        return task.agreement(reference, predictions), ""
+
+    def ap_of(parts) -> tuple[float | None, str]:
+        result, job = run_evaluation(parts, task, evaluation)
+        if result is None:
+            return None, ("NPU lost" if job.device_lost else "failed") + f": {(job.error or '')[-120:]}"
+        return result["AP"], ""
+
+    quantized: dict[tuple[int, bool], ov.Model] = {}  # (graph id, scheme) -> INT8 graph (quantized once)
+
+    def quantize(graph: ov.Model, transformer: bool) -> ov.Model:
+        key = (id(graph), transformer)
+        if key not in quantized:
+            log(f"quantizing to INT8 ({'transformer' if transformer else 'CNN'} scheme, "
+                f"{len(calibration or samples)} calibration samples)")
+            quantized[key] = int8_ptq(graph, task, calibration or samples, transformer)
+        return quantized[key]
+
+    state = State(model, config)
+    current_ms = measure({"current": state.parts(device)}, device, rounds=rounds, iterations=iterations)["current"].median_ms
+    current_agreement, note = accuracy(state)
+    if current_agreement is None:
+        # e.g. YOLO26-S on 2 NPU tiles loses the device on real images: an inexact state to repair
+        log(f"the original model fails on {device} ({note}): looking for a placement that works")
+        current_agreement = 0.0
+    log(f"original: {current_ms:.2f} ms, agreement {current_agreement:.3f}")
+    report = OptimizationReport(device, current_ms, current_agreement, state, current_ms, current_agreement)
+    if evaluation is not None:
+        report.reference_ap, note = ap_of([(model, "cpu", None)])
+        if report.reference_ap is None:
+            raise RuntimeError(f"evaluation of the original on the CPU failed: {note}")
+        report.baseline_ap = ap_of(state.parts(device))[0] if current_agreement > 0 else None
+        log(f"AP: CPU FP32 {report.reference_ap:.3f}, original on {device} {report.baseline_ap}")
+    # exact: agrees with the CPU FP32 original and, when annotations are given, keeps its AP (on YOLO26-N
+    # with 2 NPU tiles, agreement 0.966 on 30 images hid a loss of 4 AP points, PLAN.md P3.1)
+    exact_state = current_agreement >= min_agreement and (
+        evaluation is None or (report.baseline_ap is not None and report.baseline_ap >= report.reference_ap - ap_budget))
+    if not exact_state:
+        log(f"the original is inexact on {device}: looking for exact placements first")
+    adaptive = Adaptive("current")
+    searched: set[tuple[int, bool]] = set()  # (graph id, scheme) already searched for mixed precision
+
+    def mixed_precision(base: State, full: State, full_ap: float, full_ms: float,
+                        transformer: bool) -> tuple[State, Trial] | None:
+        """Full INT8 is faster but outside the AP budget: keep the module groups in float that recover
+        the most AP per ms of latency (each measured alone against full INT8), then verify the mix.
+        The group recovering the most AP is split into its sub-modules (and measured again) while it
+        costs more than a quarter of what INT8 saves, so that only its sensitive part stays in float."""
+
+        def assess(groups: dict[str, list[str]]) -> dict[str, tuple[float, float]]:
+            # sensitivity only ranks the groups: a smaller calibration set (5x faster on the CPU) is enough;
+            # the chosen mix is then quantized with the full set and verified
+            pool = calibration or samples
+            quick = pool[:: max(1, len(pool) // sensitivity_samples)][:sensitivity_samples]
+            alone = {g: dataclasses.replace(base, model=int8_ptq(base.model, task, quick, transformer, names))
+                     for g, names in groups.items()}
+            timings = measure({"int8": full.parts(device), **{g: s.parts(device) for g, s in alone.items()}}, device,
+                              rounds=rounds, iterations=iterations, adaptive=Adaptive("int8"))
+            gains = {}
+            for g, s in alone.items():
+                saving, _ = paired_saving(timings, "int8", g)
+                ap, _ = ap_of(s.parts(device))
+                gains[g] = (ap - full_ap if ap is not None else float("nan"), -saving)
+                log(f"  float {g}: AP {gains[g][0]:+.4f}, latency {gains[g][1]:+.2f} ms")
+            return gains
+
+        groups = quantizable_groups(base.model)
+        log(f"mixed precision: {len(groups)} groups, each kept in float alone")
+        gains = assess(groups)
+        for _ in range(3):
+            useful = [g for g in gains if np.isfinite(gains[g][0]) and gains[g][0] > 0]
+            if not useful:
+                break
+            best = max(useful, key=lambda g: gains[g][0])
+            subs = split_group(base.model, best, groups[best])
+            if gains[best][1] <= 0.25 * (current_ms - full_ms) or not subs:
+                break
+            log(f"mixed precision: splitting {best} ({gains[best][1]:+.2f} ms) into {len(subs)} parts")
+            del groups[best], gains[best]
+            groups.update(subs)
+            gains.update(assess(subs))
+        floor = report.reference_ap - ap_budget
+        order = choose_float_groups(gains, float("inf"))  # every useful group, best AP per ms first
+        for k in range(max(1, len(choose_float_groups(gains, floor - full_ap))), len(order) + 1):
+            chosen = order[:k]
+            names = [n for g in chosen for n in groups[g]]
+            mixed = dataclasses.replace(base, model=int8_ptq(base.model, task, calibration or samples, transformer, names),
+                                        changes=[*base.changes, f"int8-mixed (float: {', '.join(chosen)})"])
+            t = measure({"current": base.parts(device), "mixed": mixed.parts(device)}, device, rounds=rounds,
+                        iterations=iterations, adaptive=adaptive)
+            saving, ci = paired_saving(t, "current", "mixed")
+            trial = Trial(mixed.label(), "approx", current_ms - saving,
+                          note=f"{len(chosen)} of {len(groups)} module groups kept in float")
+            report.trials.append(trial)
+            if not (saving - ci > 0 and saving > 0.01 * current_ms):
+                trial.note += f" (no significant gain: {saving:+.2f} +- {ci:.2f} ms; more float only slows down)"
+                return None
+            trial.ap, error = ap_of(mixed.parts(device))
+            if trial.ap is not None and trial.ap >= floor:
+                trial.agreement, _ = accuracy(mixed)
+                return mixed, trial
+            trial.note += f" ({error or f'AP below {floor:.3f}'})"
+        return None
+
+    for _ in range(max_steps):
+        neighbours = _neighbours(state, quantize if int8 else None)
+        if not neighbours:
+            break
+        variants = {"current": state.parts(device)}
+        variants.update({f"n{i}": s.parts(device) for i, (s, _, _) in enumerate(neighbours)})
+        timings = measure(variants, device, rounds=rounds, iterations=iterations, adaptive=adaptive)
+        savings = {i: paired_saving(timings, "current", f"n{i}") for i in range(len(neighbours))}
+        order = sorted(savings, key=lambda i: -np.nan_to_num(savings[i][0], nan=-np.inf))
+        # once an approximation is accepted (judged by AP), the state is the new reference: exact
+        # candidates on top of it must keep its agreement (within 0.02) instead of reaching min_agreement
+        approximated = any(c.startswith("int8") for c in state.changes)
+        exact_now = exact_state
+        exact_floor = current_agreement - 0.02 if approximated else min_agreement
+        applied = False
+        for i in order:
+            candidate, kind, description = neighbours[i]
+            t, (saving, ci) = timings[f"n{i}"], savings[i]
+            trial = Trial(candidate.label(), kind, current_ms - saving, note=description)
+            repaired = False
+            report.trials.append(trial)
+            if t.error is not None:
+                trial.note = f"does not compile: {t.error[-100:]}"
+                continue
+            # a gain counts when it is above zero with 95 % confidence and worth 1 % of the latency
+            faster = saving - ci > 0 and saving > 0.01 * current_ms
+            if (exact_now or kind == "approx") and not faster:
+                trial.note += f" (no significant gain: {saving:+.2f} +- {ci:.2f} ms)"
+                continue
+            trial.agreement, error = accuracy(candidate)
+            if trial.agreement is None:
+                trial.note = error
+                continue
+            if kind == "approx" and evaluation is not None:
+                trial.ap, error = ap_of(candidate.parts(device))
+                floor = report.reference_ap - ap_budget
+                if trial.ap is None or trial.ap < floor:
+                    trial.note += f" ({error or f'AP below {floor:.3f}'})"
+                    transformer = candidate.changes[-1] == "int8-transformer"
+                    key = (id(state.model), transformer)
+                    if trial.ap is None or key in searched:
+                        continue
+                    searched.add(key)
+                    found = mixed_precision(state, candidate, trial.ap, trial.latency_ms, transformer)
+                    if found is None:
+                        continue
+                    candidate, trial = found
+            elif kind == "approx":
+                if trial.agreement < min_agreement:
+                    trial.note += f" (agreement < {min_agreement}; pass an evaluation set to judge by AP)"
+                    continue
+            elif exact_now:  # the candidate must stay exact
+                if trial.agreement < exact_floor:
+                    trial.note += f" (agreement < {exact_floor:.3f})"
+                    continue
+            else:  # repairing an inexact state: correctness first, verified by AP when available
+                repaired = trial.agreement >= min_agreement
+                if repaired and evaluation is not None:
+                    trial.ap, error = ap_of(candidate.parts(device))
+                    repaired = trial.ap is not None and trial.ap >= report.reference_ap - ap_budget
+                if not repaired and not (faster and trial.agreement > current_agreement):
+                    trial.note += f" (still inexact: agreement {trial.agreement:.3f}" + (
+                        f", AP {trial.ap:.3f})" if trial.ap is not None else ")")
+                    continue
+            if trial.agreement is None:
+                trial.note += " (accuracy check failed)"
+                continue
+            trial.accepted, applied = True, True
+            log(f"accepted {candidate.label()}: {trial.latency_ms:.2f} ms, agreement {trial.agreement:.3f}")
+            state, current_ms, current_agreement = candidate, trial.latency_ms, trial.agreement
+            exact_state = exact_now or kind == "approx" or repaired
+            break
+        if not applied:
+            break
+
+    report.final, report.final_ms, report.final_agreement = state, current_ms, current_agreement
+    if evaluation is not None:
+        report.final_ap = report.baseline_ap if not state.changes else ap_of(state.parts(device))[0]
+    if recommend:
+        what_ifs = [c for c in graph_rewrites(state.model, state.config) if c.kind == "retrain"]
+        if what_ifs:
+            variants = {"current": state.parts(device)}
+            for c in what_ifs:
+                variant = dataclasses.replace(state, model=c.parts[0][0])
+                variants[c.name] = variant.parts(device)
+            timings = measure(variants, device, rounds=rounds, iterations=iterations, adaptive=adaptive)
+            for c in what_ifs:
+                saving, ci = paired_saving(timings, "current", c.name)
+                note = c.description if timings[c.name].error is None else f"does not compile: {timings[c.name].error[-80:]}"
+                report.recommendations.append(Trial(c.name, c.kind, current_ms - saving, note=f"{note} (+-{ci:.2f} ms)"))
+            report.recommendations.sort(key=lambda t: t.latency_ms)
+    return report

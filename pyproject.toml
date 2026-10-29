@@ -30,6 +30,7 @@ dependencies = [
     "transformers>=4.50",  # pretrained D-FINE / RT-DETRv2 and their training losses
     "scipy",               # Hungarian matching in DETR losses
     "pycocotools",
+    "psutil",              # memory / time watchdog of sandboxed NPU compilations
 ]
 
 [project.optional-dependencies]

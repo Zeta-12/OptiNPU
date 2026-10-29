@@ -43,6 +43,35 @@ def export_openvino(
     return output
 
 
+def load_model(model, input_shape: tuple[int, ...] | None = None) -> ov.Model:
+    """Any model as a static-shape ov.Model: an ov.Model, an IR (.xml) or ONNX path, or a
+    torch.nn.Module (then `input_shape` is required). `input_shape` also fixes a dynamic input of a
+    single-input IR / ONNX model. Constant subgraphs are folded; nothing else is changed (the NPU
+    patches are exact rewrites that the optimizer applies and measures).
+    """
+    from optinpu.devices import core
+
+    if isinstance(model, ov.Model):
+        ov_model = model
+    elif isinstance(model, (str, Path)):
+        path = Path(model)
+        ov_model = core().read_model(path) if path.suffix == ".xml" else ov.convert_model(path)
+    else:
+        import torch
+
+        if input_shape is None:
+            raise ValueError("a PyTorch model needs input_shape, e.g. (1, 3, 640, 640)")
+        with torch.no_grad():
+            ov_model = ov.convert_model(model.eval().cpu(), example_input=torch.zeros(input_shape),
+                                        input=[tuple(input_shape)])
+    if input_shape is not None and ov_model.inputs[0].get_partial_shape().is_dynamic:
+        ov_model.reshape({ov_model.inputs[0]: ov.PartialShape(list(input_shape))})
+    dynamic = [p.get_friendly_name() for p in ov_model.get_parameters() if p.get_partial_shape().is_dynamic]
+    if dynamic:
+        raise ValueError(f"dynamic inputs {dynamic}: the NPU needs static shapes, pass input_shape")
+    return fold_constants(ov_model)
+
+
 def fold_constants(ov_model: ov.Model) -> ov.Model:
     """Precompute in FP32 every subgraph that does not depend on the input.
 

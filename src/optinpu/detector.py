@@ -78,6 +78,14 @@ class Detector:
     def class_names(self) -> list[str]:
         return self.spec.class_names
 
+    @property
+    def task(self):
+        """The model's input / output conventions as an optinpu.tasks.DetectionTask (profiler, optimizer)."""
+        from optinpu.tasks import DetectionTask
+
+        return DetectionTask(self.spec.imgsz, "optinpu", "stretch", self.spec.mean, self.spec.std,
+                             class_names=list(self.class_names))
+
     def train(self, data, val=None, run: str = "train", **config) -> TrainResult:
         """Fine-tune on a COCO-format dataset, then keep the best EMA weights.
 
