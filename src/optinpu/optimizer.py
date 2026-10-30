@@ -10,11 +10,13 @@ Greedy loop over a deployment state (graph, compile options, placement of the se
    above zero with 95 % confidence, is applied;
 4. repeat until nothing helps. A state that is inexact on the device (e.g. YOLO26-N on 2 NPU tiles,
    or YOLO26-S losing the NPU) accepts any candidate that repairs it, even a slower one: correctness
-   first. With an annotated `evaluation` set, "exact" also requires the AP to stay within `ap_budget`.
+   first. With an annotated `evaluation` set, "exact" means that the task metric (AP, top-1) stays
+   within `ap_budget` of the CPU FP32 original; the agreement only decides without annotations.
 Approximate candidates (INT8 post-training quantization) change the function on purpose: with an
 annotated `evaluation` set, they are judged by their AP against the CPU FP32 reference (`ap_budget`);
 without one, by the same agreement threshold as exact candidates. They can repair an inexact state
-(INT8 removes the 2-tile defect of RT-DETRv2), but mixed precision is only searched on an exact one.
+(INT8 removes the 2-tile defect of RT-DETRv2); on an inexact state, mixed precision is only searched
+when full INT8 already keeps the mean AP within the budget and misses only its confidence bound.
 The network stays on the device: only a light selection tail (TopK / NMS and the gathers after it, no
 convolution or matmul) may move to the CPU, as host post-processing. Heavier parts (a DETR decoder,
 everything after an encoder) move only to the devices listed in `offload`, for comparison: the NPU is
@@ -103,7 +105,7 @@ class Trial:
     agreement: float | None = None
     accepted: bool = False
     note: str = ""
-    ap: float | None = None  # on the evaluation set, approx candidates only
+    ap: float | None = None  # task metric (AP, top-1) on the evaluation set, judged candidates only
 
 
 @dataclass
@@ -119,6 +121,7 @@ class OptimizationReport:
     reference_ap: float | None = None  # CPU FP32 original, on the evaluation set
     baseline_ap: float | None = None  # original on the device
     final_ap: float | None = None
+    metric: str = "AP"  # what the *_ap fields measure (the task's metric: AP, top-1)
 
     def __str__(self) -> str:
         speedup = self.baseline_ms / self.final_ms if self.final_ms else float("nan")
@@ -126,12 +129,12 @@ class OptimizationReport:
                  f"agreement with CPU FP32 {self.baseline_agreement:.3f} -> {self.final_agreement:.3f}"]
         if self.reference_ap is not None:
             fmt = lambda ap: "failed" if ap is None else f"{ap:.3f}"
-            lines.append(f"AP on the evaluation set: CPU FP32 {fmt(self.reference_ap)}, original on {self.device} "
-                         f"{fmt(self.baseline_ap)}, optimized {fmt(self.final_ap)}")
+            lines.append(f"{self.metric} on the evaluation set: CPU FP32 {fmt(self.reference_ap)}, original on "
+                         f"{self.device} {fmt(self.baseline_ap)}, optimized {fmt(self.final_ap)}")
         lines += [f"applied: {self.final.label()}", "", "trials:"]
         for t in self.trials:
             agreement = "  -  " if t.agreement is None else f"{t.agreement:.3f}"
-            ap = "" if t.ap is None else f"  AP {t.ap:.3f}"
+            ap = "" if t.ap is None else f"  {self.metric} {t.ap:.3f}"
             mark = "ACCEPTED" if t.accepted else ""
             lines.append(f"  {t.label[:56]:<56} {t.latency_ms:7.2f} ms  agreement {agreement}{ap}  {mark} {t.note}")
         if self.recommendations:
@@ -145,6 +148,7 @@ class OptimizationReport:
         return {"device": self.device, "applied": self.final.changes, "baseline_ms": self.baseline_ms,
                 "final_ms": self.final_ms, "speedup": self.baseline_ms / self.final_ms,
                 "baseline_agreement": self.baseline_agreement, "final_agreement": self.final_agreement,
+                "metric": self.metric,
                 "ap": {"cpu_fp32": self.reference_ap, "baseline": self.baseline_ap, "final": self.final_ap},
                 "trials": [dataclasses.asdict(t) for t in self.trials],
                 "recommendations": [dataclasses.asdict(t) for t in self.recommendations]}
@@ -155,13 +159,13 @@ class OptimizationReport:
         md = [f"# {title}", "",
               f"**{self.baseline_ms:.2f} ms → {self.final_ms:.2f} ms on the {self.device.upper()} ({speedup:.2f}×)**, "
               f"applied: {', '.join(f'`{c}`' for c in self.final.changes) or 'nothing'}.", "",
-              "| | Latency | Agreement with CPU FP32 | AP (evaluation set) |", "|---|---|---|---|",
+              f"| | Latency | Agreement with CPU FP32 | {self.metric} (evaluation set) |", "|---|---|---|---|",
               f"| CPU FP32 reference | — | 1.000 | {fmt(self.reference_ap)} |",
               f"| Original on the {self.device.upper()} | {self.baseline_ms:.2f} ms | {self.baseline_agreement:.3f} | "
               f"{fmt(self.baseline_ap)} |",
               f"| **Optimized** | **{self.final_ms:.2f} ms** | **{self.final_agreement:.3f}** | **{fmt(self.final_ap)}** |",
               "", "## Candidates tried", "",
-              "| Candidate | Kind | Latency | Agreement | AP | Decision |", "|---|---|---|---|---|---|"]
+              f"| Candidate | Kind | Latency | Agreement | {self.metric} | Decision |", "|---|---|---|---|---|---|"]
         for t in self.trials:
             decision = "**accepted**" if t.accepted else t.note.replace("|", "/")
             latency = "—" if not np.isfinite(t.latency_ms) else f"{t.latency_ms:.2f} ms"
@@ -235,9 +239,10 @@ def _neighbours(state: State, int8=None, offload: tuple[str, ...] = (),
             out.append((dataclasses.replace(state, model=int8(state.model, transformer),
                                             changes=[*state.changes, name]),
                         "approx", f"INT8 post-training quantization (NNCF, {scheme})"))
-    tiles = 2 if (state.config or {}).get("NPU_TILES") == 1 else 1
-    out.append((dataclasses.replace(state, config={**(state.config or {}), "NPU_TILES": tiles},
-                                    changes=[*state.changes, f"tiles={tiles}"]), "exact", f"NPU_TILES={tiles}"))
+    if device == "npu":  # a compile option of the NPU plugin only
+        tiles = 2 if (state.config or {}).get("NPU_TILES") == 1 else 1
+        out.append((dataclasses.replace(state, config={**(state.config or {}), "NPU_TILES": tiles},
+                                        changes=[*state.changes, f"tiles={tiles}"]), "exact", f"NPU_TILES={tiles}"))
     if state.offload is None:
         found = selection_tail(state.model)
         if found is not None:
@@ -275,6 +280,7 @@ def optimize(
     calibration: list | None = None,
     evaluation=None,
     ap_budget: float = 0.005,
+    folds: int = 10,
     int8: bool = True,
     sensitivity_samples: int = 64,
     offload: tuple[str, ...] = (),
@@ -286,11 +292,13 @@ def optimize(
 ) -> OptimizationReport:
     """Optimize `model` (ov.Model or IR path) for `device`; see the module docstring.
 
-    samples: image sources (detection) or lists of input arrays (OutputTask), 30 or more recommended.
+    samples: image sources (detection, classification) or lists of input arrays (OutputTask), 30 or more.
     calibration: samples for INT8 quantization (default: `samples`; ideally 300, disjoint from them).
-    evaluation: an annotated optinpu.data.CocoSubset (detectors): approximate candidates must keep the AP
-    within `ap_budget` (0.005 = 0.5 AP point) of the CPU FP32 original on it, and the original or a
-    repair must stay within it to count as exact. Use images that are not those you report results on.
+    evaluation: an annotated optinpu.data.CocoSubset (detectors) or optinpu.data.LabeledImages
+    (classifiers): approximate candidates must keep the task metric (AP, top-1) within `ap_budget`
+    (0.005 = 0.5 point) of the CPU FP32 original on it, and the original or a repair must stay within it
+    to count as exact. Use images that are not those you report results on. folds: interleaved folds of
+    it for the paired test (about 50 images each: 500 images left a ~0.4-point margin, PLAN.md P3.5).
     int8: try INT8 post-training quantization; sensitivity_samples: calibration samples used to rank the
     module groups of a mixed precision search (the final mix uses all of `calibration`).
     offload: devices ("gpu", "cpu") that may run more than a light selection tail, e.g. a DETR decoder;
@@ -310,22 +318,24 @@ def optimize(
             return None, ("NPU lost" if job.device_lost else "failed") + f": {(job.error or '')[-120:]}"
         return task.agreement(reference, predictions), ""
 
+    metric = getattr(task, "metric", "AP")  # AP (detection), top-1 (classification)
+
     def ap_of(parts) -> tuple[float | None, list[float] | None, str]:
-        """(AP, AP per fold, error) on the evaluation set."""
-        result, job = run_evaluation(parts, task, evaluation)
+        """(metric, metric per fold, error) on the evaluation set."""
+        result, job = run_evaluation(parts, task, evaluation, folds=folds)
         if result is None:
             return None, None, ("NPU lost" if job.device_lost else "failed") + f": {(job.error or '')[-120:]}"
-        return result["AP"], result["fold_ap"], ""
+        return result["score"], result["fold_scores"], ""
 
     reference_folds: list[float] = []
 
     def judge(parts) -> tuple[bool, float | None, str]:
-        """(AP loss vs the CPU FP32 original within the budget with 95 % confidence, AP, verdict)."""
-        ap, folds, error = ap_of(parts)
+        """(metric loss vs the CPU FP32 original within the budget with 95 % confidence, metric, verdict)."""
+        ap, scores, error = ap_of(parts)
         if ap is None:
             return False, None, error
-        ok, mean, margin = ap_within_budget(folds, reference_folds, ap_budget)
-        return ok, ap, (f"AP {100 * mean:+.2f} points vs CPU, 95 % lower bound {100 * (mean - margin):+.2f}, "
+        ok, mean, margin = ap_within_budget(scores, reference_folds, ap_budget)
+        return ok, ap, (f"{metric} {100 * mean:+.2f} points vs CPU, 95 % lower bound {100 * (mean - margin):+.2f}, "
                         f"budget -{100 * ap_budget:.1f}")
 
     quantized: dict[tuple[int, bool], ov.Model] = {}  # (graph id, scheme) -> INT8 graph (quantized once)
@@ -346,18 +356,20 @@ def optimize(
         log(f"the original model fails on {device} ({note}): looking for a placement that works")
         current_agreement = 0.0
     log(f"original: {current_ms:.2f} ms, agreement {current_agreement:.3f}")
-    report = OptimizationReport(device, current_ms, current_agreement, state, current_ms, current_agreement)
+    report = OptimizationReport(device, current_ms, current_agreement, state, current_ms, current_agreement,
+                                metric=metric)
     baseline_ok = True
     if evaluation is not None:
-        report.reference_ap, folds, note = ap_of([(model, "cpu", None)])
+        report.reference_ap, scores, note = ap_of([(model, "cpu", None)])
         if report.reference_ap is None:
             raise RuntimeError(f"evaluation of the original on the CPU failed: {note}")
-        reference_folds[:] = folds
+        reference_folds[:] = scores
         baseline_ok, report.baseline_ap, note = judge(state.parts(device)) if current_agreement > 0 else (False, None, "")
-        log(f"AP: CPU FP32 {report.reference_ap:.3f}, original on {device} {report.baseline_ap} ({note})")
-    # exact: agrees with the CPU FP32 original and, when annotations are given, keeps its AP (on YOLO26-N
-    # with 2 NPU tiles, agreement 0.966 on 30 images hid a loss of 4 AP points, PLAN.md P3.1)
-    exact_state = current_agreement >= min_agreement and baseline_ok
+        log(f"{metric}: CPU FP32 {report.reference_ap:.3f}, original on {device} {report.baseline_ap} ({note})")
+    # exact: with annotations, the metric decides (agreement 0.966 on 30 images hid a 4-point AP loss of
+    # YOLO26-N on 2 NPU tiles, PLAN.md P3.1, while D-FINE-N's 0.923 hides a 0.2-point loss only, P3.5);
+    # without annotations, the agreement with the CPU FP32 original does
+    exact_state = baseline_ok if evaluation is not None else current_agreement >= min_agreement
     if not exact_state:
         log(f"the original is inexact on {device}: looking for exact placements first")
     adaptive = Adaptive("current")
@@ -384,19 +396,19 @@ def optimize(
                 saving, _ = paired_saving(timings, "int8", g)
                 ap = ap_of(s.parts(device))[0]  # point estimates: they only rank the groups
                 gains[g] = (ap - full_ap if ap is not None else float("nan"), -saving)
-                log(f"  float {g}: AP {gains[g][0]:+.4f}, latency {gains[g][1]:+.2f} ms")
+                log(f"  float {g}: {metric} {gains[g][0]:+.4f}, latency {gains[g][1]:+.2f} ms")
             return gains
 
         groups = quantizable_groups(base.model)
         log(f"mixed precision: {len(groups)} groups, each kept in float alone")
         gains = assess(groups)
         for _ in range(3):
-            useful = [g for g in gains if np.isfinite(gains[g][0]) and gains[g][0] > 0]
-            if not useful:
-                break
-            best = max(useful, key=lambda g: gains[g][0])
-            subs = split_group(base.model, best, groups[best])
-            if gains[best][1] <= 0.25 * (current_ms - full_ms) or not subs:
+            # the most useful of the costly groups that can be split: (rest) cannot, and stopping at it
+            # left D-FINE-N's backbone whole (PLAN.md P3.5)
+            costly = sorted((g for g in gains if g != "(rest)" and np.isfinite(gains[g][0]) and gains[g][0] > 0
+                             and gains[g][1] > 0.25 * (current_ms - full_ms)), key=lambda g: -gains[g][0])
+            best, subs = next(((g, s) for g in costly if (s := split_group(base.model, g, groups[g]))), (None, {}))
+            if best is None:
                 break
             log(f"mixed precision: splitting {best} ({gains[best][1]:+.2f} ms) into {len(subs)} parts")
             del groups[best], gains[best]
@@ -435,11 +447,12 @@ def optimize(
         timings = measure(variants, device, rounds=rounds, iterations=iterations, adaptive=adaptive)
         savings = {i: paired_saving(timings, "current", f"n{i}") for i in range(len(neighbours))}
         order = sorted(savings, key=lambda i: -np.nan_to_num(savings[i][0], nan=-np.inf))
-        # once an approximation is accepted (judged by AP), the state is the new reference: exact
-        # candidates on top of it must keep its agreement (within 0.02) instead of reaching min_agreement
+        # once an approximation is accepted, or when the metric judges exactness, the state is the
+        # reference: exact candidates on top of it must keep its agreement (within 0.02) instead of
+        # reaching min_agreement
         approximated = any(c.startswith("int8") for c in state.changes)
         exact_now = exact_state
-        exact_floor = current_agreement - 0.02 if approximated else min_agreement
+        exact_floor = current_agreement - 0.02 if approximated or evaluation is not None else min_agreement
         applied = False
         for i in order:
             candidate, kind, description = neighbours[i]
@@ -466,9 +479,12 @@ def optimize(
                 if not ok:
                     transformer = candidate.changes[-1] == "int8-transformer"
                     key = (id(state.model), transformer)
-                    # on an inexact state, keeping groups in float only brings back its own error
-                    # (RT-DETRv2 on 2 tiles, PLAN.md P3.4): no mixed precision search there
-                    if trial.ap is None or key in searched or not exact_now:
+                    # on an inexact state, keeping groups in float can bring its own error back, so the
+                    # search only runs when INT8 already repairs it and misses the budget by its confidence
+                    # bound alone (RT-DETRv2, INT8 transformer on 2 tiles: -0.29 points, bound -0.59; the
+                    # slower 1-tile repair was taken instead, PLAN.md P3.5)
+                    close = trial.ap is not None and trial.ap - report.reference_ap > -ap_budget
+                    if trial.ap is None or key in searched or not (exact_now or close):
                         continue
                     searched.add(key)
                     found = mixed_precision(state, candidate, trial.ap, trial.latency_ms, transformer)
@@ -477,15 +493,21 @@ def optimize(
                     candidate, trial = found
             elif kind == "approx":  # no annotations: an approximation must agree like an exact candidate
                 if trial.agreement < min_agreement:
-                    trial.note += f" (agreement < {min_agreement}; pass an evaluation set to judge by AP)"
+                    trial.note += f" (agreement < {min_agreement}; pass an evaluation set to judge by {metric})"
                     continue
             elif exact_now:  # the candidate must stay exact
                 if trial.agreement < exact_floor:
                     trial.note += f" (agreement < {exact_floor:.3f})"
                     continue
-            else:  # repairing an inexact state: correctness first, verified by AP when available
-                repaired = trial.agreement >= min_agreement
-                if repaired and evaluation is not None:
+                if evaluation is not None:
+                    ok, trial.ap, verdict = judge(candidate.parts(device))
+                    trial.note += f" ({verdict})"
+                    if not ok:
+                        continue
+            else:  # repairing an inexact state: correctness first, judged by the metric when available
+                if evaluation is None:
+                    repaired = trial.agreement >= min_agreement
+                elif trial.agreement > current_agreement:  # a repair agrees better: only those are judged
                     repaired, trial.ap, verdict = judge(candidate.parts(device))
                     trial.note += f" ({verdict})"
                 if not repaired and not (faster and trial.agreement > current_agreement):

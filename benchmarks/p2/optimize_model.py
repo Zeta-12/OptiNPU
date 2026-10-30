@@ -1,12 +1,16 @@
-"""P2 / P3: run the optimizer on bench models, then report AP on val2017.
+"""P2 / P3: run the optimizer on bench models, then report AP on val2017 (top-1 on ImageNetV2).
 
-Decisions use val2017 images disjoint from the reported ones (all bench models were trained on
-train2017, where their AP is inflated; P3.1 still used train2017 [9670, 10000) and [0, 200)):
+Detectors: decisions use val2017 images disjoint from the reported ones (all bench models were trained
+on train2017, where their AP is inflated; P3.1 still used train2017 [9670, 10000) and [0, 200)):
 - accuracy guard: val2017 [4970, 5000); INT8 calibration: [4500, 4800) (as in L2 / M0);
-- AP budget of approximate candidates (INT8, mixed precision) and of repairs: [2500, 3000), judged on 10
-  folds of 50 images against the CPU FP32 original (loss within the budget with 95 % confidence; P3.2
-  and the first P3.4 batch used [2500, 2700) and a point estimate).
-The final AP is measured on val2017 [0, N), on which nothing was decided. Results go to
+- AP budget, which decides what is exact (the original, repairs) and what approximations may cost:
+  [2500, 3500), judged on 20 folds of 50 images against the CPU FP32 original (loss within the budget
+  with 95 % confidence). P3.2 and the first P3.4 batch used [2500, 2700) and a point estimate; P3.4 and
+  the first P3.5 runs used [2500, 3000) in 10 folds, which left a ~0.4-point margin.
+The final AP is measured on val2017 [0, N), on which nothing was decided.
+Classifiers (ImageNet weights): slices of the fixed shuffle of ImageNetV2 (optinpu.data.imagenetv2_subset),
+none of which the models were trained on: guard [7300, 7600) (top-1 agreement), calibration
+[7000, 7300), top-1 budget [5000, 7000) in 10 folds of 200, report [0, 5000). Results go to
 runs/p3/optimize_<model>_<precision>.json (the network on the NPU, only the final selection on the CPU),
 or runs/p3/offload-<devices>/ with --offload (e.g. a DETR decoder on the iGPU, for comparison; batches
 1 to 3 of P3.4 allowed gpu,cpu); models already done are skipped (resumable, so the bench can be run a
@@ -18,45 +22,74 @@ few models at a time).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import sys
 
 import openvino as ov
 
 from benchmarks.m0.baselines import ROOT
 from benchmarks.p0.models import all_models
-from optinpu.data import coco_val_subset
+from optinpu.data import coco_val_subset, imagenetv2_subset
 from optinpu.optimizer import optimize
 from optinpu.sandbox import run_evaluation
-from optinpu.tasks import DetectionTask
+from optinpu.tasks import ClassificationTask
 
 OUT = ROOT / "runs" / "p3"
+
+
+def on_ac_power() -> bool | None:
+    """True on mains power, False on battery, None when unknown (latency on battery is throttled: the
+    first P3.5 run started unplugged, 48.4 ms for RT-DETRv2 instead of 47.5)."""
+    if sys.platform != "win32":
+        return None
+
+    class Status(ctypes.Structure):
+        _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("percent", ctypes.c_ubyte),
+                    ("saver", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full", ctypes.c_ulong)]
+
+    status = Status()
+    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+        return None
+    return {0: False, 1: True}.get(status.ac)
+
+
+def splits(task, args) -> tuple[list, list, object, int, object, str]:
+    """(guard images, calibration images, evaluation set, its folds, report set, report set name)."""
+    if isinstance(task, ClassificationTask):
+        return (imagenetv2_subset(300, 7300).image_paths(), imagenetv2_subset(300, 7000).image_paths(),
+                imagenetv2_subset(2000, 5000) if args.eval_images else None, 10,
+                imagenetv2_subset(5000) if args.images else None, "ImageNetV2 [0, 5000)")
+    return (coco_val_subset(30, offset=4970).image_paths(), coco_val_subset(300, offset=4500).image_paths(),
+            coco_val_subset(args.eval_images, offset=2500) if args.eval_images else None,
+            max(2, args.eval_images // 50), coco_val_subset(args.images) if args.images else None,
+            f"val2017 [0, {args.images})")
 
 
 def run(name: str, precision: str, args) -> dict:
     entry = next(m for m in all_models() if m.name == name)
     model = ov.Core().read_model(entry.irs[precision])
-    detector = isinstance(entry.task, DetectionTask)
-    report = optimize(model, entry.task, coco_val_subset(30, offset=4970).image_paths(), "npu", None,
-                      calibration=coco_val_subset(300, offset=4500).image_paths(),
-                      evaluation=coco_val_subset(args.eval_images, offset=2500) if detector and args.eval_images else None,
-                      ap_budget=args.ap_budget / 100, int8=not args.no_int8, offload=offload(args))
+    guard, calibration, evaluation, folds, report_set, report_name = splits(entry.task, args)
+    report = optimize(model, entry.task, guard, "npu", None, calibration=calibration, evaluation=evaluation,
+                      ap_budget=args.ap_budget / 100, folds=folds, int8=not args.no_int8, offload=offload(args))
     print(report, flush=True)
-    record = {"model": name, "precision": precision, "protocol": "val2017 selection", "offload": offload(args),
-              "report": str(report),
+    protocol = "ImageNetV2 slices" if isinstance(entry.task, ClassificationTask) else "val2017 selection"
+    record = {"model": name, "precision": precision, "protocol": protocol, "metric": report.metric,
+              "offload": offload(args), "report": str(report),
               "applied": report.final.label(),
               "baseline_ms": report.baseline_ms, "final_ms": report.final_ms,
               "baseline_agreement": report.baseline_agreement, "final_agreement": report.final_agreement,
               "selection_ap": {"cpu": report.reference_ap, "baseline": report.baseline_ap, "final": report.final_ap},
               "trials": [vars(t) for t in report.trials], "recommendations": [vars(t) for t in report.recommendations]}
-    if detector and args.images:
-        subset = coco_val_subset(args.images)
+    if report_set is not None:
         val = {}
         for label, parts in (("cpu", [(model, "cpu", None)]), ("baseline", [(model, "npu", None)]),
                              ("final", report.final.parts("npu"))):
-            result, job = run_evaluation(parts, entry.task, subset)
-            val[label] = result["AP"] if result else f"failed: {(job.error or '')[-100:]}"
+            result, job = run_evaluation(parts, entry.task, report_set)
+            val[label] = result["score"] if result else f"failed: {(job.error or '')[-100:]}"
         record["val_ap"] = val
-        print(f"\nAP on val2017 [0, {args.images}): {val}", flush=True)
+        print(f"\n{report.metric} on {report_name}: {val}", flush=True)
+    record["ac_power_at_end"] = on_ac_power()
     return record
 
 
@@ -68,11 +101,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("models", nargs="+", help="model:precision of benchmarks.p0.models")
     parser.add_argument("--ap-budget", type=float, default=0.5, help="AP points an approximate rewrite may cost")
-    parser.add_argument("--eval-images", type=int, default=500, help="val2017 images [2500, ...) for the AP budget")
+    parser.add_argument("--eval-images", type=int, default=1000,
+                        help="val2017 images [2500, ...) for the AP budget, in folds of 50 (0: no AP; classifiers: on/off)")
     parser.add_argument("--images", type=int, default=500, help="val2017 images for the final AP")
     parser.add_argument("--no-int8", action="store_true")
     parser.add_argument("--offload", default="", help="devices for a heavy tail, e.g. gpu,cpu (default: none)")
     parser.add_argument("--force", action="store_true", help="redo models already done")
+    parser.add_argument("--allow-battery", action="store_true", help="measure even on battery power")
     args = parser.parse_args()
     out = OUT / f"offload-{'-'.join(offload(args))}" if offload(args) else OUT
     out.mkdir(parents=True, exist_ok=True)
@@ -82,6 +117,8 @@ def main():
         if path.exists() and not args.force:
             print(f"{spec}: already done ({path})", flush=True)
             continue
+        if on_ac_power() is False and not args.allow_battery:
+            sys.exit(f"{spec}: on battery power, latencies would be throttled; plug the PC in (or --allow-battery)")
         print(f"===== {spec}", flush=True)
         path.write_text(json.dumps(run(name, precision, args), indent=1, default=str))
 

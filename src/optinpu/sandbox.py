@@ -287,14 +287,20 @@ def _deployed(spec: dict):
 
 
 def _evaluate(spec: dict) -> dict:
-    """COCO AP of a model (spec["parts"], spec["task"]) on spec["subset"] (CocoSubset fields)."""
+    """Task metric of a model (spec["parts"], spec["task"]) on spec["subset"]: COCO AP (CocoSubset fields)
+    or top-1 accuracy (LabeledImages fields). "score" / "fold_scores" hold the metric, whichever it is."""
     from optinpu.data.coco import CocoSubset
-    from optinpu.evaluate import evaluate_coco
+    from optinpu.data.imagenet import LabeledImages
+    from optinpu.evaluate import evaluate_coco, evaluate_top1
 
-    s = spec["subset"]
+    s, folds = spec["subset"], spec.get("folds", 10)
+    if "labels" in s:
+        result = evaluate_top1(_deployed(spec), LabeledImages([Path(p) for p in s["paths"]], s["labels"]), folds)
+        return {**result, "score": result["top1"], "fold_scores": result["fold_top1"]}
     names = {int(k): v for k, v in s["file_names"].items()} if s.get("file_names") else None
     subset = CocoSubset(Path(s["annotations"]), Path(s["image_dir"]), s["image_ids"], s["category_ids"], names)
-    return evaluate_coco(_deployed(spec), subset, "sandbox", "-", folds=spec.get("folds", 10)).as_dict()
+    result = evaluate_coco(_deployed(spec), subset, "sandbox", "-", folds=folds).as_dict()
+    return {**result, "score": result["AP"], "fold_scores": result["fold_ap"]}
 
 
 def _predict(spec: dict) -> dict:
@@ -354,16 +360,22 @@ def run_predictions(parts: list, task, samples: list, timeout: float = 1800,
 
 
 def run_evaluation(parts: list, task, subset, timeout: float = 3600,
-                   max_gb: float = 12.0) -> tuple[dict | None, JobResult]:
-    """COCO metrics (optinpu.evaluate.EvalResult fields) of a model given as [(model, device, config)]
-    parts on `subset` (an optinpu.data.CocoSubset), computed in a watched child process."""
+                   max_gb: float = 12.0, folds: int = 10) -> tuple[dict | None, JobResult]:
+    """Metrics of a model given as [(model, device, config)] parts on `subset`, computed in a watched
+    child process: COCO metrics (optinpu.evaluate.EvalResult fields) on an optinpu.data.CocoSubset, or
+    top-1 accuracy on optinpu.data.LabeledImages; "score" / "fold_scores" (on `folds` interleaved
+    folds) in both cases."""
     from optinpu.tasks import task_to_dict
 
+    if hasattr(subset, "labels"):
+        fields = {"paths": [str(p) for p in subset.paths], "labels": [int(c) for c in subset.labels]}
+    else:
+        fields = {"annotations": str(subset.annotations), "image_dir": str(subset.image_dir),
+                  "image_ids": list(subset.image_ids), "category_ids": list(subset.category_ids),
+                  "file_names": subset.file_names}
     with tempfile.TemporaryDirectory(prefix="optinpu-eval-") as tmp:
-        spec = {"job": "evaluate", "parts": save_parts(parts, tmp), "task": task_to_dict(task),
-                "subset": {"annotations": str(subset.annotations), "image_dir": str(subset.image_dir),
-                           "image_ids": list(subset.image_ids), "category_ids": list(subset.category_ids),
-                           "file_names": subset.file_names}}
+        spec = {"job": "evaluate", "parts": save_parts(parts, tmp), "task": task_to_dict(task), "subset": fields,
+                "folds": folds}
         job = run_job(spec, timeout, max_gb)
     return (job.result if job.ok else None), job
 

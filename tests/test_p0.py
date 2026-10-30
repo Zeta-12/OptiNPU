@@ -145,6 +145,58 @@ def test_sandboxed_evaluation_matches_in_process(toy_coco):
     assert len(result["fold_ap"]) == 10 and len(expected.fold_ap) == 3  # the sandbox job uses 10 folds
 
 
+def test_classification_inputs_match_torchvision():
+    import torchvision.models as tvm
+
+    from optinpu.tasks import ClassificationTask, task_from_dict, task_to_dict
+
+    image = Image.fromarray(np.random.default_rng(0).integers(0, 255, (180, 300, 3), dtype=np.uint8))
+    for weights, task in ((tvm.ResNet50_Weights.DEFAULT, ClassificationTask((224, 224), 232, "bilinear")),
+                          (tvm.EfficientNet_B0_Weights.DEFAULT, ClassificationTask((224, 224), 256, "bicubic"))):
+        (x,), _ = task.inputs(image)
+        np.testing.assert_allclose(x[0], weights.transforms()(image).numpy(), atol=1e-5)
+        assert task_from_dict(task_to_dict(task)) == task
+    a, b = [np.array([0.1, 2.0, 0.3])], [np.array([0.1, 0.2, 3.0])]
+    assert ClassificationTask().agreement([a, a], [a, b]) == 0.5  # same top-1 on one sample of two
+
+
+class TinyClassifier(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 4, 3, 2)
+        self.fc = torch.nn.Linear(4, 3)
+
+    def forward(self, x):
+        return self.fc(self.conv(x).mean((2, 3)))
+
+
+def test_sandboxed_top1_matches_in_process(tmp_path):
+    from optinpu.data.imagenet import imagenetv2_subset, labeled_folder
+    from optinpu.evaluate import evaluate_top1
+    from optinpu.sandbox import run_evaluation
+    from optinpu.tasks import ClassificationTask, Deployed
+
+    rng = np.random.default_rng(0)
+    for label in range(3):
+        (tmp_path / "images" / str(label)).mkdir(parents=True)
+        for i in range(4):
+            Image.fromarray(rng.integers(0, 255, (40, 50, 3), dtype=np.uint8)).save(tmp_path / "images" / str(label) / f"{i}.jpeg")
+    every = labeled_folder(tmp_path)
+    assert len(every.paths) == 12 and every.labels[:4] == [0] * 4
+    subset = imagenetv2_subset(8, 2, root=tmp_path)
+    assert subset.paths == imagenetv2_subset(8, 2, root=tmp_path).paths  # one fixed shuffle
+    assert not set(subset.paths) & set(imagenetv2_subset(2, 0, root=tmp_path).paths)  # disjoint slices
+
+    torch.manual_seed(0)
+    model = load_model(TinyClassifier(), (1, 3, 32, 32))
+    task = ClassificationTask((32, 32), 36)
+    result, job = run_evaluation([(model, "cpu", None)], task, subset, timeout=120)
+    assert job.ok, job.error
+    expected = evaluate_top1(Deployed(model, task, "cpu", cache_dir=None), subset, folds=4)
+    assert result["score"] == pytest.approx(expected["top1"]) and result["num_images"] == 8
+    assert len(result["fold_scores"]) == 10 and len(expected["fold_top1"]) == 4
+
+
 def test_failed_job_reports_the_error(tmp_path):
     job = run_job({"job": "latency", "ir": str(tmp_path / "missing.xml"), "device": "cpu"}, timeout=120)
     assert not job.ok and job.error

@@ -48,6 +48,11 @@ model = Deployed(load_deployment("yolo26n_npu/"), task)
 model.predict("image.jpg")
 ```
 
+A guided tour on a toy detector, with nothing to download (about 2 minutes on the NPU):
+`python examples/profile_and_optimize.py`. It checks the NPU against the CPU, measures how much weight
+values matter, profiles the model, optimizes it (4.3 → 2.8 ms: INT8, then the final top-k on the CPU)
+and reloads the saved deployment.
+
 **Profiler** (`profile_measured`, `optinpu profile --measured`). For each module region and each op type,
 the latency saved when it is bypassed, measured in paired, randomized rounds until the 95 % confidence
 interval is narrow. The NPU's own counters overlap (they sum to 3-10x the real latency) and an additive
@@ -208,6 +213,6 @@ tile is exact but slower; `npu+gpu` is both exact and the fastest.
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest       # 91 tests, ~50 s; NPU tests are skipped without an NPU
+.venv\Scripts\python -m pytest       # 94 tests, ~1 min; NPU tests are skipped without an NPU
 .venv\Scripts\ruff check src tests examples
 ```

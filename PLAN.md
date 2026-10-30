@@ -155,7 +155,7 @@ Protocole : la recherche (choix des réécritures) se fait sur des images de tra
 | P0 | Socle : tâches (détection, générique), chargement IR / ONNX / PyTorch, compilation surveillée en sous-processus ; banc d'évaluation (les 9 modèles de M0, OptiDet-N, CNN de M1) | Les 10 détecteurs passent par l'API générique avec les AP de M0 |
 | P1 | Profileur mesuré : latence par profondeur, contournement de régions, what-if ; regroupement par module d'origine | Ses prédictions de gain collent mieux aux gains réels que les compteurs du constructeur et qu'un modèle de coût additif |
 | P2 | Cadre de réécritures sur l'IR, garde d'exactitude, réécritures exactes | Gain mesuré sur les 10 modèles, ΔAP nul |
-| P3 | Réécritures approchées, précision mixte guidée par la latence, boucle sous budget, rapport, CLI `optinpu optimize`. Découpé en étapes courtes, avec une pause après chacune (le PC sert aussi à autre chose) : P3.1 INT8 comme candidat approché et budget d'AP (~30 min de NPU) ; P3.2 précision mixte guidée par la latence (~45 min) ; P3.3 rapport et CLI ; P3.4 optimiseur sur les détecteurs, par paquets de 2-3 modèles, avec reprise (paquets 1 à 3 avec décodeur sur iGPU autorisé, gardés comme comparaison) ; P3.5 même banc en NPU seul, 9 détecteurs en 3 paquets | Accélération à ΔAP ≤ 0,3-0,5 sur les 10 modèles |
+| P3 | Réécritures approchées, précision mixte guidée par la latence, boucle sous budget, rapport, CLI `optinpu optimize`. Découpé en étapes courtes, avec une pause après chacune (le PC sert aussi à autre chose) : P3.1 INT8 comme candidat approché et budget d'AP (~30 min de NPU) ; P3.2 précision mixte guidée par la latence (~45 min) ; P3.3 rapport et CLI ; P3.4 optimiseur sur les détecteurs, par paquets de 2-3 modèles, avec reprise (paquets 1 à 3 avec décodeur sur iGPU autorisé, gardés comme comparaison) ; P3.5 même banc en NPU seul : 7 détecteurs et 3 classifieurs ImageNet, en 3 paquets | Accélération à ΔAP ≤ 0,3-0,5 sur les 10 modèles |
 | P4 | Réécritures avec réentraînement : what-if côté PyTorch, récupération par distillation sans étiquettes et QAT | Démontré sur D-FINE-N et un CNN (licences compatibles) |
 | P5 | Évaluation pour l'article : ablations, comparaisons (défauts OpenVINO, PTQ par défaut, guidage par les compteurs du constructeur, placement hybride) | Tableaux et figures reproductibles |
 
@@ -166,6 +166,7 @@ Protocole : la recherche (choix des réécritures) se fait sur des images de tra
 - **Travaux à situer** : nn-Meter, NetAdapt, HAQ, MobileDets, EfficientNet-EdgeTPU, HOT (Samsung), Grassroots Operator Search (IBM, DATE 2025), optimiseur de graphe d'Arm, TASO / PET, tests de compilateurs DL (NNSmith).
 - **Limite assumée** : un seul NPU (3720, pilote 32.0.100.4778).
 - **Cible** : à décider (prépublication arXiv, puis atelier ou revue).
+- **V0** (2026-10-30) : `paper/main.tex` + `references.bib`, template IEEEtran (conférence), en anglais, environ 5 400 mots (au-delà des 6 pages habituelles). Écrit pour vérifier la maturité de l'outil et des résultats ; tout ce qui manque est marqué `\todo{}` en rouge (31 marques), surtout les résultats DETR en NPU seul (P3.5), la récupération après réentraînement (P4), la campagne sur machine au repos et l'AP sur val2017 complet (P5). Les chiffres de validation du profileur sont recalculés sans OptiDet (5 modèles, 150 interventions, 73 significatives).
 
 ---
 
@@ -643,3 +644,35 @@ Observations :
 | tout sur 1 tuile | 80,6 ms | 0,995 |
 
   Le défaut est bien dans le décodeur, mais la réparation est chère : découper le graphe en deux inférences NPU coûte à lui seul +8,9 ms, et le décodeur sur 1 tuile +19 ms. Elle ne bat `tiles=1` que de 5 ms ; la mesure départagera avec l'INT8 transformer en 2 tuiles.
+
+### P3.5 — banc en NPU seul (en cours)
+
+**Modèles de l'article (décision du 2026-10-30)** : 7 détecteurs, YOLO26-N/S, D-FINE-N/S, DEIMv2-N, RT-DETRv2-R18, RF-DETR-N (DEIMv2-S retiré : export à −4 AP ; RF-DETR-S retiré : 125 ms, redondant avec RF-DETR-N), et **3 classifieurs ImageNet** pour montrer l'outil hors détection : ResNet-50, MobileNetV2, EfficientNet-B0 (poids torchvision, 224 px).
+
+**Paquets** : (1) RT-DETRv2, D-FINE-N, DEIMv2-N ; (2) D-FINE-S, RF-DETR-N, YOLO26-N ; (3) YOLO26-S et les 3 classifieurs.
+
+**Classifieurs dans la lib** : `tasks.ClassificationTask` (prétraitement torchvision : petit côté redimensionné, recadrage central, normalisation ; identique à torchvision à 1e-5, testé), accord = part des images de même classe top-1 ; `data.imagenetv2_subset` (ImageNetV2 matched frequency, 10 000 images, une permutation fixe découpée en tranches disjointes), `evaluate.evaluate_top1`, job `evaluate` du sandbox et optimiseur indépendants de la métrique (`score` / `fold_scores`, `task.metric` = AP ou top-1). Protocole : garde [7300, 7600) (300 images), calibration [7000, 7300), budget top-1 [5000, 7000) en 10 plis de 200, rapport [0, 5000). Top-1 CPU FP32 sur 500 images : ResNet-50 70,0 %, MobileNetV2 61,6 %, EfficientNet-B0 67,4 % (≈ −11 points face à ImageNet, comme attendu).
+
+**Alimentation** : le premier lancement a démarré sur batterie (RT-DETRv2 d'origine 48,4 ms au lieu de 47,5) ; relancé sur secteur. Le banc refuse désormais de démarrer un modèle sur batterie et note l'état à la fin de chaque modèle (`ac_power_at_end`).
+
+**Correction 6 — précision mixte sur un état inexact.** RT-DETRv2, première passe (`runs/p3/old-rule-no-mixed-on-inexact/`) : l'INT8 transformer en 2 tuiles (40,6 ms) répare le défaut mais rate le budget de justesse (−0,29 point, borne −0,59) ; la précision mixte étant interdite sur un état inexact, l'optimiseur a pris la réparation `decoder-on-1-tile` (75,9 ms), puis un INT8 mixte : **71,0 ms (0,67×)**, 50,7 AP sur val [0, 500) (CPU 50,8, original 48,0). Désormais, la recherche de précision mixte est permise sur un état inexact quand la perte moyenne de l'INT8 est déjà dans le budget (seule la borne de confiance échoue). Relancé.
+- Avec la correction 6, RT-DETRv2 en NPU seul : INT8 mixte en 2 tuiles (4 groupes en flottant, dont `(rest)`), **47,3 → 42,3 ms (1,12×)**, 50,8 AP sur val [0, 500) (CPU 50,8, original 48,0) ; résultat sur 500 images d'évaluation, archivé dans `runs/p3/eval500-agreement-and-ap/`.
+
+**Correction 7 — l'AP décide de l'exactitude, sur 1000 images (décision du 2026-10-30).** D-FINE-N d'origine : accord 0,923 (< 0,95) et AP −0,25 point (borne −0,64 avec 10 plis de 50 images) ; l'optimiseur a payé 15 ms (26,0 → 41,2 ms, `decoder-on-1-tile`) pour réparer une perte réelle de 0,2 point, dans le budget. Désormais, avec un jeu annoté, l'exactitude se juge par la métrique seule (original, réparations, candidats exacts sur un état exact) ; l'accord ne décide que sans annotations, et sert de plancher relatif (−0,02) aux candidats exacts. Jeu de budget : val2017 [2500, 3500), 20 plis de 50 images (marge attendue ~0,25 point). Paquet 1 relancé en entier pour l'homogénéité du protocole. (Premier lancement interrompu par un bogue : le paramètre `folds` écrasé par la liste des AP par pli de la référence ; test `test_optimize_judges_exactness_by_the_metric` ajouté.)
+
+**Paquet 1, résultats (NPU seul, protocole final ; `runs/p3/optimize_*.json`)** :
+
+| Modèle | Avant | Après | Appliqué | AP val2017 [0, 500) : CPU / avant / après |
+|---|---|---|---|---|
+| RT-DETRv2-R18 | 47,4 ms (AP −2,40, borne −2,77) | **40,6 ms (1,17×)** | réparation : INT8 schéma transformer, 2 tuiles | 50,8 / 48,0 / 50,8 |
+| D-FINE-N | 26,0 ms (AP −0,18, borne −0,44 : exact) | 26,0 ms (1,00×) | rien | 45,8 / 45,6 / 45,6 |
+| DEIMv2-N | 24,0 ms (AP −0,44, borne −0,69) | 41,2 ms (0,58×) | réparation : 1 tuile | 46,7 / 45,7 / 46,6 |
+
+- **RT-DETRv2** : avec 1000 images, l'INT8 transformer complet passe le test (sur 500 : refusé de justesse, puis INT8 mixte à 42,3 ms). Aucune perte sur le rapport.
+- **D-FINE-N** : l'original est exact ; l'INT8 complet ne gagne que 0,3 ms pour −5,9 points (perte dans le backbone, et dans `(rest)` : +2,85 points et −0,47 ms s'il reste en flottant, le groupe le plus utile) ; aucun mélange ne tient le budget (16 groupes sur 17 en flottant : encore −2,5 points). Garder en flottant la plupart des groupes du décodeur *accélère* l'INT8 (−0,1 à −0,4 ms).
+- **DEIMv2-N** : réparation coûteuse mais justifiée, l'original perdant 0,93 point sur les images du rapport. INT8 CNN −22,5 points, INT8 transformer −1,2 ; mélanges sur 1 tuile au mieux −0,56 (borne −0,98). Avec un budget d'un point, l'original serait gardé : le budget est le réglage de l'utilisateur.
+- Coût : ~3 h 15 pour le paquet (RT-DETRv2 ~35 min, D-FINE-N ~1 h 45 dont la recherche de précision mixte, DEIMv2-N ~1 h).
+
+**Exemple utilisateur** (`examples/profile_and_optimize.py`, ~1 min 40 sur le NPU, ~1 min 10 sur CPU, rien à télécharger) : faux détecteur 320 px (SiLU, depthwise, LayerNorm sur 6 400 tokens, top-300 dans le graphe), poids aléatoires, garde sur les sorties brutes. Sur le NPU : accord 1,000 ; poids aléatoires −0,1 ms (top-k dépendant des données), 50 % de zéros +0,55 ms (plus lent) ; profil : la LayerNorm coûte 41 % ; optimisation 4,28 → 2,83 ms (INT8 puis sélection sur CPU) ; recommandations SiLU → ReLU −14,5 %, LayerNorm → BatchNorm −12,3 % ; déploiement rechargé (NPU + CPU), accord 0,998. Au passage, `tiles=1/2` n'est plus proposé hors NPU.
+
+**Correction 8 — affinage de la précision mixte.** Seul le groupe le plus utile était découpé ; quand c'est `(rest)` (indécoupable), l'affinage s'arrêtait (D-FINE-N : backbone jamais découpé). Désormais : le plus utile des groupes coûteux (plus d'un quart du gain INT8) et découpables. Sans effet attendu sur D-FINE-N (gain INT8 total de 0,3 ms).

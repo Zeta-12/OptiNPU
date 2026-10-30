@@ -6,6 +6,8 @@
 - 7 ImageNet CNNs from torchvision (feature extractors, random weights), latency only: the
   accuracy guard compares raw outputs (OutputTask). They cover blocks absent from the detectors
   (depthwise, squeeze-excitation, HardSwish, LayerNorm).
+- 3 ImageNet classifiers (pretrained torchvision weights, 224 px), judged by top-1 accuracy on
+  ImageNetV2 (ClassificationTask): the optimizer beyond detection (PLAN.md P3.5).
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from benchmarks.m0.baselines import BASELINES, ROOT
-from optinpu.tasks import DetectionTask, OutputTask
+from optinpu.tasks import ClassificationTask, DetectionTask, OutputTask
 
 IR_DIR = ROOT / "runs" / "p0" / "ir"
 OPTIDET_QAT = ROOT / "runs" / "optidet-n" / "m2_coco10k_e10_kd" / "m2_qat" / "qat_int8.xml"
@@ -27,7 +29,7 @@ class BenchModel:
     name: str
     family: str
     license: str
-    task: DetectionTask | OutputTask
+    task: DetectionTask | ClassificationTask | OutputTask
     irs: dict[str, Path]  # precision -> IR ("fp16", "fp32", "int8")
     split: str | None = None  # head of the hybrid npu+gpu placement
     npu_config: dict | None = None  # known-good NPU config (M0: 1 tile when 2 tiles lose AP)
@@ -64,5 +66,27 @@ def cnn(name: str, resolution: int = 640) -> BenchModel:
     return BenchModel(f"{name}_{resolution}", "torchvision CNN", "BSD-3-Clause", OutputTask(), {"fp32": path})
 
 
+CLASSIFIERS = ("resnet50", "mobilenet_v2", "efficientnet_b0")
+
+
+def classifier(name: str) -> BenchModel:
+    """torchvision classifier with its default ImageNet weights (downloaded once by torchvision), exported
+    once to runs/p0/ir/<name>_cls224.xml (FP32), with its own preprocessing (resize, interpolation)."""
+    import torchvision.models as tvm
+
+    weights = tvm.get_model_weights(name).DEFAULT
+    transforms = weights.transforms()
+    task = ClassificationTask((224, 224), transforms.resize_size[0], transforms.interpolation.value)
+    path = IR_DIR / f"{name}_cls224.xml"
+    if not path.exists():
+        import openvino as ov
+
+        from optinpu.export import load_model
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ov.save_model(load_model(tvm.get_model(name, weights=weights), (1, 3, 224, 224)), path, compress_to_fp16=False)
+    return BenchModel(f"{name}_cls224", "torchvision classifier", "BSD-3-Clause", task, {"fp32": path})
+
+
 def all_models() -> list[BenchModel]:
-    return detectors() + [cnn(name) for name in CNNS]
+    return detectors() + [cnn(name) for name in CNNS] + [classifier(name) for name in CLASSIFIERS]

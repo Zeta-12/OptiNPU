@@ -65,7 +65,7 @@ def test_optimize_loop_on_cpu():
     # what gets accepted depends on CPU timing, so trials are matched by their last change
     last = {t.label.split(" + ")[-1] for t in report.trials}
     assert {"depthwise-to-dense", "int8", "int8-transformer"} <= last  # LayerNorm present: both INT8 schemes
-    assert all(t.note.startswith("does not compile") for t in report.trials if t.label.endswith("tiles=1"))
+    assert not any("tiles=" in t.label for t in report.trials)  # an NPU option: never tried on the CPU
     assert {t.label for t in report.recommendations} >= {"activations-to-relu", "layernorm-to-batchnorm", "prune-50"}
     assert "optimized for cpu" in str(report)
 
@@ -85,6 +85,23 @@ def test_report_saves_a_deployment_that_reloads(tmp_path):
     reloaded = Deployed(parts, OutputTask(), cache_dir=None).run(sample)
     original = Deployed(report.final.parts("cpu"), OutputTask(), cache_dir=None).run(sample)
     assert OutputTask().agreement(original, reloaded) > 0.99  # FP16 weights in the saved IRs
+
+
+def test_optimize_judges_exactness_by_the_metric(toy_coco):
+    from optinpu.data.dataset import CocoDetection
+    from optinpu.optimizer import optimize
+    from optinpu.tasks import DetectionTask
+    from tests.test_p0 import TinyDetector
+
+    torch.manual_seed(0)
+    model = load_model(TinyDetector(), (1, 3, 32, 32))
+    task = DetectionTask((32, 32), class_names=["other", "thing"])
+    subset = CocoDetection(*toy_coco, imgsz=(32, 32)).to_subset()
+    report = optimize(model, task, subset.image_paths(), device="cpu", evaluation=subset, folds=3, int8=False,
+                      recommend=False, rounds=2, iterations=5, log=lambda *a: None)
+    # on the CPU the deployed original is the FP32 reference itself: same AP, so exact
+    assert report.metric == "AP" and report.reference_ap is not None
+    assert report.baseline_ap == pytest.approx(report.reference_ap)
 
 
 def test_ap_budget_is_judged_with_confidence():

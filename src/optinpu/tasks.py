@@ -2,12 +2,13 @@
 
 The comparison (`agreement`, 1.0 = identical) is the accuracy guard of the profiler and optimizer:
 a rewrite or a compile option is acceptable when the device run still agrees with the reference
-(CPU FP32 of the original model). Detection is the reference task; `OutputTask` covers any model.
+(CPU FP32 of the original model). Detection is the reference task, classification the second one
+(`metric`: what an annotated evaluation set measures); `OutputTask` covers any model.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,6 +22,8 @@ from optinpu.postprocess import Detections, decode, load_image, preprocess
 from optinpu.runtime import DEFAULT_CACHE, compile_hybrid, compile_model
 
 LETTERBOX_PAD = 114
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def letterbox(image: Image.Image, imgsz: tuple[int, int]) -> tuple[np.ndarray, float, tuple[int, int]]:
@@ -57,6 +60,7 @@ class DetectionTask:
     """
 
     name: ClassVar[str] = "detection"
+    metric: ClassVar[str] = "AP"
     imgsz: tuple[int, int]
     output: str = "optinpu"
     resize: str = "stretch"
@@ -107,6 +111,42 @@ class DetectionTask:
 
 
 @dataclass
+class ClassificationTask:
+    """Image classification, torchvision preprocessing: the shorter side resized to `resize`, a center
+    crop of `imgsz`, mean / std normalization. Predictions are [logits]; agreement is the share of
+    samples whose top-1 class matches the reference (the classifier's guard, as F1 is the detector's).
+    """
+
+    name: ClassVar[str] = "classification"
+    metric: ClassVar[str] = "top-1"
+    imgsz: tuple[int, int] = (224, 224)
+    resize: int = 256
+    interpolation: str = "bilinear"  # or "bicubic" (EfficientNet)
+    mean: tuple[float, float, float] = IMAGENET_MEAN
+    std: tuple[float, float, float] = IMAGENET_STD
+
+    def inputs(self, source) -> tuple[list[np.ndarray], None]:
+        image = load_image(source)
+        short, long = sorted(image.size)
+        size = (self.resize, int(self.resize * long / short))  # as torchvision: (shorter, longer) side
+        w, h = size if image.width <= image.height else size[::-1]
+        resample = {"bilinear": Image.BILINEAR, "bicubic": Image.BICUBIC}[self.interpolation]
+        image = image.resize((w, h), resample)
+        ch, cw = self.imgsz
+        left, top = int(round((w - cw) / 2.0)), int(round((h - ch) / 2.0))
+        x = np.asarray(image.crop((left, top, left + cw, top + ch)), dtype=np.float32) / 255.0
+        x = (x - np.array(self.mean, dtype=np.float32)) / np.array(self.std, dtype=np.float32)
+        return [np.ascontiguousarray(x.transpose(2, 0, 1)[None])], None
+
+    def decode(self, outputs: list[np.ndarray], meta=None, conf: float = 0.0) -> list[np.ndarray]:
+        return [np.asarray(outputs[0], dtype=np.float32).reshape(-1)]
+
+    def agreement(self, reference: list, test: list) -> float:
+        same = [int(np.argmax(r[0])) == int(np.argmax(t[0])) for r, t in zip(reference, test)]
+        return float(np.mean(same)) if same else 0.0
+
+
+@dataclass
 class OutputTask:
     """Any model: a sample is the list of its input arrays, predictions are the raw outputs.
 
@@ -132,8 +172,8 @@ class OutputTask:
 
 def task_to_dict(task) -> dict:
     """JSON-ready description of a task (to rebuild it in a sandboxed process)."""
-    if isinstance(task, DetectionTask):
-        return {"name": "detection", **{k: getattr(task, k) for k in task.__dataclass_fields__}}
+    if isinstance(task, (DetectionTask, ClassificationTask)):
+        return {"name": task.name, **{f.name: getattr(task, f.name) for f in fields(task)}}
     if isinstance(task, OutputTask):
         return {"name": "outputs"}
     raise TypeError(f"cannot serialize task {task!r}")
@@ -145,6 +185,8 @@ def task_from_dict(data: dict):
     if name == "detection":
         data["imgsz"] = tuple(data["imgsz"])
         return DetectionTask(**data)
+    if name == "classification":
+        return ClassificationTask(**{k: tuple(v) if isinstance(v, list) else v for k, v in data.items()})
     return OutputTask()
 
 

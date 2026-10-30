@@ -1,4 +1,4 @@
-"""COCO mAP evaluation of a Detector on any backend."""
+"""COCO mAP evaluation of a Detector, and top-1 accuracy of a classifier, on any backend."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ import io
 import time
 from dataclasses import asdict, dataclass
 
+import numpy as np
+
 from optinpu.data.coco import CocoSubset
+from optinpu.data.imagenet import LabeledImages
 
 _STAT_NAMES = ("AP", "AP50", "AP75", "APs", "APm", "APl")
 
@@ -78,6 +81,17 @@ def evaluate_coco(
     fold_ap = [_stats(gt, results, list(subset.image_ids[k::folds]))["AP"] for k in range(folds)] if folds else None
     return EvalResult(detector.name, device, precision, len(subset.image_ids), **stats, seconds_per_image=elapsed,
                       fold_ap=fold_ap)
+
+
+def evaluate_top1(classifier, subset: LabeledImages, folds: int = 0) -> dict:
+    """Top-1 accuracy of `classifier` (predict(source) -> [logits], e.g. tasks.Deployed with a
+    ClassificationTask) on a labeled subset; folds > 0 also gives it on interleaved folds, as evaluate_coco."""
+    t0 = time.perf_counter()
+    hits = np.array([int(np.argmax(classifier.predict(path)[0])) == label
+                     for path, label in zip(subset.paths, subset.labels)], dtype=np.float64)
+    elapsed = (time.perf_counter() - t0) / max(len(hits), 1)
+    return {"top1": float(hits.mean()), "fold_top1": [float(hits[k::folds].mean()) for k in range(folds)] if folds else None,
+            "num_images": len(hits), "seconds_per_image": elapsed}
 
 
 def format_eval_table(results: list[EvalResult]) -> str:
