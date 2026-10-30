@@ -25,9 +25,25 @@ class EvalResult:
     APm: float
     APl: float
     seconds_per_image: float  # end-to-end, including image decoding and pre/post-processing
+    fold_ap: list[float] | None = None  # AP on interleaved folds of the images (paired comparisons)
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def _stats(gt, results: list[dict], image_ids: list[int], verbose: bool = False) -> dict[str, float]:
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    quiet = contextlib.nullcontext() if verbose else contextlib.redirect_stdout(io.StringIO())
+    with quiet:
+        dt = gt.loadRes(results) if results else COCO()
+        ev = COCOeval(gt, dt, "bbox")
+        ev.params.imgIds = image_ids
+        ev.evaluate()
+        ev.accumulate()
+        ev.summarize()
+    return dict(zip(_STAT_NAMES, (float(s) for s in ev.stats[:6])))
 
 
 def evaluate_coco(
@@ -36,10 +52,12 @@ def evaluate_coco(
     device: str = "npu",
     precision: str = "fp16",
     verbose: bool = False,
+    folds: int = 0,
 ) -> EvalResult:
-    """Standard COCO bbox mAP. Keeps the top-300 (query, class) pairs per image, no threshold."""
+    """Standard COCO bbox mAP. Keeps the top-300 (query, class) pairs per image, no threshold.
+    folds > 0 also gives the AP on `folds` interleaved folds of the images (image_ids[k::folds]): two
+    models evaluated on the same subset can then be compared fold by fold, with a confidence interval."""
     from pycocotools.coco import COCO
-    from pycocotools.cocoeval import COCOeval
 
     results = []
     t0 = time.perf_counter()
@@ -54,18 +72,12 @@ def evaluate_coco(
             })
     elapsed = (time.perf_counter() - t0) / len(subset.image_ids)
 
-    quiet = contextlib.nullcontext() if verbose else contextlib.redirect_stdout(io.StringIO())
-    with quiet:
+    with contextlib.redirect_stdout(io.StringIO()):
         gt = COCO(str(subset.annotations))
-        dt = gt.loadRes(results) if results else COCO()
-        ev = COCOeval(gt, dt, "bbox")
-        ev.params.imgIds = subset.image_ids
-        ev.evaluate()
-        ev.accumulate()
-        ev.summarize()
-
-    stats = dict(zip(_STAT_NAMES, (float(s) for s in ev.stats[:6])))
-    return EvalResult(detector.name, device, precision, len(subset.image_ids), **stats, seconds_per_image=elapsed)
+    stats = _stats(gt, results, list(subset.image_ids), verbose)
+    fold_ap = [_stats(gt, results, list(subset.image_ids[k::folds]))["AP"] for k in range(folds)] if folds else None
+    return EvalResult(detector.name, device, precision, len(subset.image_ids), **stats, seconds_per_image=elapsed,
+                      fold_ap=fold_ap)
 
 
 def format_eval_table(results: list[EvalResult]) -> str:

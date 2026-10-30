@@ -140,8 +140,9 @@ def test_sandboxed_evaluation_matches_in_process(toy_coco):
     task = DetectionTask((32, 32), class_names=["other", "thing"])
     result, job = run_evaluation([(model, "cpu", None)], task, subset, timeout=120)
     assert job.ok, job.error
-    expected = evaluate_coco(Deployed(model, task, "cpu", cache_dir=None), subset, "cpu", "fp32")
+    expected = evaluate_coco(Deployed(model, task, "cpu", cache_dir=None), subset, "cpu", "fp32", folds=3)
     assert result["AP"] == pytest.approx(expected.AP) and result["num_images"] == 6
+    assert len(result["fold_ap"]) == 10 and len(expected.fold_ap) == 3  # the sandbox job uses 10 folds
 
 
 def test_failed_job_reports_the_error(tmp_path):

@@ -59,13 +59,16 @@ accuracy against the CPU FP32 original (detection F1 on guard images, or COCO AP
 
 | Kind | Rewrites |
 |---|---|
-| exact | final selection (TopK / NMS and after) on the CPU; DETR decoder on the iGPU / CPU; NPU tiles; depthwise as dense conv |
+| exact | final selection (TopK / NMS and after) on the CPU; NPU tiles; depthwise as dense conv |
 | approximate (AP budget) | INT8 post-training quantization (both NNCF schemes); latency-guided mixed precision when full INT8 misses the budget |
 | retraining (reported) | SiLU / GELU -> ReLU, LayerNorm -> BatchNorm, 50-75 % weight pruning: latency measured before any training |
 
-Models that are wrong or crash on the NPU (e.g. YOLO26-S losing the device on 2 tiles) are repaired
-first. Every compilation and inference runs in a watched child process (`optinpu.sandbox`): a compiler
-using 50 GB or a lost NPU cannot take your process down.
+The network stays on the NPU, which keeps the CPU and iGPU free at low power: only a light final
+selection (no convolution or matmul) moves to the CPU, as host post-processing. Heavier parts, such as a
+DETR decoder, move to the iGPU or CPU only when you allow it (`offload=("gpu",)`, `--offload gpu`), for
+comparison. Models that are wrong or crash on the NPU (e.g. YOLO26-S losing the device on 2 tiles) are
+repaired first. Every compilation and inference runs in a watched child process (`optinpu.sandbox`): a
+compiler using 50 GB or a lost NPU cannot take your process down.
 
 Results on this machine (Core Ultra 5 235U, NPU 3720; AP on COCO val2017 [0, 500), decisions taken on
 other images):
@@ -74,7 +77,6 @@ other images):
 |---|---|---|---|---|
 | YOLO26-N | 25.9 ms | **8.5 ms** | selection on the CPU | 44.8 / 40.7 / 44.8 |
 | YOLO26-S | 33.0 ms, loses the NPU | **13.7 ms** | selection on the CPU + mixed INT8 | 50.8 / - / 50.6 |
-| D-FINE-N | 25.4 ms | **15.0 ms** | decoder on the iGPU | 45.8 / 45.6 / 45.6 |
 
 ## Training
 
@@ -206,6 +208,6 @@ tile is exact but slower; `npu+gpu` is both exact and the fastest.
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest       # 87 tests, ~45 s; NPU tests are skipped without an NPU
+.venv\Scripts\python -m pytest       # 91 tests, ~50 s; NPU tests are skipped without an NPU
 .venv\Scripts\ruff check src tests examples
 ```

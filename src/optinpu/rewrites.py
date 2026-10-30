@@ -54,9 +54,10 @@ def selection_tail(model: ov.Model) -> tuple[list[str], int, int] | None:
     return [first], len(runtime), sum(k in HEAVY for k in runtime)
 
 
-def placements(model: ov.Model, config: dict | None = None) -> list[Candidate]:
+def placements(model: ov.Model, config: dict | None = None, offload: tuple[str, ...] = ()) -> list[Candidate]:
     """Move what follows the first TopK / NMS off the NPU: to the CPU when it is a light selection
-    tail (end-to-end detector heads); to the iGPU or CPU when it is a heavy decoder (DETR)."""
+    tail (end-to-end detector heads, host post-processing); to the `offload` devices ("gpu", "cpu")
+    when it is a heavy decoder (DETR), none by default: the network stays on the NPU."""
     found = selection_tail(model)
     if found is None:
         return []
@@ -67,7 +68,7 @@ def placements(model: ov.Model, config: dict | None = None) -> list[Candidate]:
                           f"run the final selection ({n_ops} ops from {roots[0]}) on the CPU")]
     return [Candidate(f"decoder-to-{device}", "exact", [(head, "npu", config), (tail, device, None)],
                       f"run the {n_ops} ops after {roots[0]} ({heavy} matmul / conv) on the {device.upper()}")
-            for device in ("gpu", "cpu")]
+            for device in offload]
 
 
 def tiles(config: dict | None) -> list[Candidate]:
@@ -171,11 +172,16 @@ def int8_ptq(model: ov.Model, task, calibration: list, transformer: bool | None 
 
 def quantizable_groups(model: ov.Model, count: int = 10) -> dict[str, list[str]]:
     """Module regions holding the convolutions / matmuls (what INT8 accelerates), for mixed precision:
-    region name -> names of its runtime ops. About `count` groups, each with at least one heavy op."""
+    region name -> names of its runtime ops. About `count` groups, each with at least one heavy op,
+    plus "(rest)": the ops of every other region, which NNCF quantizes too (on D-FINE-N, 64 quantizers
+    on the decoder's box arithmetic stayed with every heavy group in float, at -3 AP points)."""
     from optinpu.profiler import module_regions, pick_depth
 
     regions = module_regions(model, pick_depth(model, count))
     groups = {r.name: r.ops for r in regions if any(t in HEAVY for t in r.types)}
+    rest = [n for r in regions if r.name not in groups for n in r.ops]
+    if groups and rest:
+        groups["(rest)"] = rest
     return groups
 
 

@@ -294,7 +294,7 @@ def _evaluate(spec: dict) -> dict:
     s = spec["subset"]
     names = {int(k): v for k, v in s["file_names"].items()} if s.get("file_names") else None
     subset = CocoSubset(Path(s["annotations"]), Path(s["image_dir"]), s["image_ids"], s["category_ids"], names)
-    return evaluate_coco(_deployed(spec), subset, "sandbox", "-").as_dict()
+    return evaluate_coco(_deployed(spec), subset, "sandbox", "-", folds=spec.get("folds", 10)).as_dict()
 
 
 def _predict(spec: dict) -> dict:

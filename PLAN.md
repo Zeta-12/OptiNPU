@@ -120,6 +120,7 @@ Décisions de l'utilisateur :
 - **Autonomie** : trois niveaux de réécritures (exactes, approchées, avec réentraînement court). Les deux premiers s'appliquent automatiquement sous un budget d'AP ; le troisième est proposé avec son gain mesuré, puis récupéré automatiquement si l'utilisateur fournit des images.
 - **Article** : l'outil est la contribution centrale ; la caractérisation du NPU et les dégradations silencieuses en sont la motivation.
 - **Matériel** : ce seul NPU (3720). Limite à assumer dans l'article ; la lib reste centrée sur OpenVINO.
+- **Cible : le réseau entier sur le NPU** (décidé le 2026-10-29, après le paquet 3 de P3.4). Seule la sélection finale légère (TopK / NMS et ce qui suit, sans conv ni matmul) peut aller sur le CPU, comme tout post-traitement côté hôte. Le placement d'une partie lourde (décodeur DETR, fin de l'encodeur) sur l'iGPU ou le CPU n'est qu'une option (`optimize(..., offload=("gpu",))`, `--offload gpu`) qui sert de comparaison en P5. Raisons : le NPU vaut par le CPU et l'iGPU qu'il laisse libres, à faible consommation ; et sur les DETR, l'outil ne faisait que retrouver le placement hybride de M0 (D-FINE-N 15,4 contre 15,5 ms ; RF-DETR-N hybride 37,4 ms, plus lent que l'iGPU seul à 23,0 ms).
 
 ### Idée directrice
 
@@ -141,7 +142,7 @@ Catalogue initial (d'après M0-M2) :
 
 | Classe | Réécritures |
 |---|---|
-| Exactes | TopK / NMS / post-traitement hors du graphe (1,2 à 2,5 ms en M1) ; depthwise en conv dense équivalente (débloque l'INT8) ; canaux complétés au multiple de 16 ; pixel shuffle en conv transposée ; formulations équivalentes d'une activation ; sorties FP16 ; gel des constantes et patches existants ; nombre de tuiles et placement sous contrôle d'exactitude |
+| Exactes | TopK / NMS / post-traitement hors du graphe (1,2 à 2,5 ms en M1) ; depthwise en conv dense équivalente (débloque l'INT8) ; canaux complétés au multiple de 16 ; pixel shuffle en conv transposée ; formulations équivalentes d'une activation ; sorties FP16 ; gel des constantes et patches existants ; nombre de tuiles, y compris par partie (décodeur sur 1 tuile, reste sur 2), sous contrôle d'exactitude |
 | Approchées, sans réentraînement | INT8 en précision mixte guidée par la sensibilité de chaque couche **et** son coût de latence mesuré (généralise l'analyse PTQ de M2.5) ; résolution ; moins de requêtes ou de couches de décodeur (DETR) ; approximations d'activations (GELU tanh) |
 | Avec réentraînement court | SiLU / HardSwish / GELU → ReLU ; LayerNorm → BatchNorm ; bilinéaire → plus proche voisin ; attention → mélangeur convolutif ; reparamétrisation RepVGG. Récupération : distillation depuis le modèle d'origine (sans étiquettes), puis QAT |
 
@@ -154,7 +155,7 @@ Protocole : la recherche (choix des réécritures) se fait sur des images de tra
 | P0 | Socle : tâches (détection, générique), chargement IR / ONNX / PyTorch, compilation surveillée en sous-processus ; banc d'évaluation (les 9 modèles de M0, OptiDet-N, CNN de M1) | Les 10 détecteurs passent par l'API générique avec les AP de M0 |
 | P1 | Profileur mesuré : latence par profondeur, contournement de régions, what-if ; regroupement par module d'origine | Ses prédictions de gain collent mieux aux gains réels que les compteurs du constructeur et qu'un modèle de coût additif |
 | P2 | Cadre de réécritures sur l'IR, garde d'exactitude, réécritures exactes | Gain mesuré sur les 10 modèles, ΔAP nul |
-| P3 | Réécritures approchées, précision mixte guidée par la latence, boucle sous budget, rapport, CLI `optinpu optimize`. Découpé en étapes courtes, avec une pause après chacune (le PC sert aussi à autre chose) : P3.1 INT8 comme candidat approché et budget d'AP (~30 min de NPU) ; P3.2 précision mixte guidée par la latence (~45 min) ; P3.3 rapport et CLI ; P3.4 optimiseur sur les 10 détecteurs, par paquets de 2-3 modèles, avec reprise | Accélération à ΔAP ≤ 0,3-0,5 sur les 10 modèles |
+| P3 | Réécritures approchées, précision mixte guidée par la latence, boucle sous budget, rapport, CLI `optinpu optimize`. Découpé en étapes courtes, avec une pause après chacune (le PC sert aussi à autre chose) : P3.1 INT8 comme candidat approché et budget d'AP (~30 min de NPU) ; P3.2 précision mixte guidée par la latence (~45 min) ; P3.3 rapport et CLI ; P3.4 optimiseur sur les détecteurs, par paquets de 2-3 modèles, avec reprise (paquets 1 à 3 avec décodeur sur iGPU autorisé, gardés comme comparaison) ; P3.5 même banc en NPU seul, 9 détecteurs en 3 paquets | Accélération à ΔAP ≤ 0,3-0,5 sur les 10 modèles |
 | P4 | Réécritures avec réentraînement : what-if côté PyTorch, récupération par distillation sans étiquettes et QAT | Démontré sur D-FINE-N et un CNN (licences compatibles) |
 | P5 | Évaluation pour l'article : ablations, comparaisons (défauts OpenVINO, PTQ par défaut, guidage par les compteurs du constructeur, placement hybride) | Tableaux et figures reproductibles |
 
@@ -564,7 +565,7 @@ YOLO26-N FP16, sans intervention : **26,0 → 8,55 ms (3,04×)**, accord 0,966 �
 
 - **Limite de la garde** : sur ces 30 images de train2017, le modèle d'origine en 2 tuiles atteint un accord de 0,966 (au-dessus du seuil de 0,95), alors qu'il perd 4,1 AP sur val2017 (accord de 0,842 sur 30 images de val). 30 images ne suffisent pas toujours : à étudier (nombre d'images, seuil, accord par classe).
 
-### P3 — réécritures approchées (en cours ; P3.1 à P3.3 faits, reste P3.4)
+### P3 — réécritures approchées (en cours ; P3.1 à P3.3 faits, P3.4 en cours)
 
 **P3.1 — INT8 dans l'optimiseur, budget d'AP.** Candidat « approché » : quantification NNCF du graphe courant (`rewrites.int8_ptq`, `quantize.quantize_model`), calibrée sur des échantillons passés par la tâche. Avec un jeu annoté (`optimize(..., evaluation=CocoSubset, ap_budget=0.005)`), un candidat approché doit garder l'AP à moins de 0,5 point de l'original sur CPU FP32, mesurée dans un sous-processus (`sandbox.run_evaluation`). Protocole (`benchmarks/p2/optimize_model.py`, résultats dans `runs/p3/`) : garde sur 30 images de train2017, calibration sur 300 autres, budget d'AP sur train2017 [0, 200), rapport sur val2017 [0, 500).
 
@@ -597,4 +598,48 @@ OptiDet est retiré du périmètre de l'article (décision du 2026-10-29) : le b
 - **Exactitude par l'AP** : avec un jeu annoté, l'original (et toute réparation) n'est « exact » que si son AP reste dans le budget, en plus de l'accord des détections. Corrige le cas YOLO26-N (accord 0,966, −4 AP).
 - **Précision mixte moins chère** : la sensibilité des groupes est estimée avec 64 images de calibration au lieu de 300 (~5× moins de CPU) ; le mélange retenu est quantifié avec toutes et vérifié. Une restauration du flottant par chirurgie du graphe INT8 a été écartée : NNCF compresse déjà les poids en int8 en mémoire.
 - README : section « Profile and optimize your own model ».
-- **Validation de bout en bout** (`benchmarks/p3/cli_folders.py`, dossiers d'images comme un utilisateur, `--no-int8`) sur YOLO26-N : l'original est jugé inexact par l'AP (32,4 contre 36,4 sur CPU, accord 0,819) ; la sélection sur CPU est acceptée après vérification de l'AP (36,6) ; 25,8 → 8,45 ms (3,05×). Le déploiement rechargé (`npu+cpu`) donne un accord de 0,995 avec le CPU FP32 sur 20 autres images.
+- **Validation de bout en bout (P3.3)** (`benchmarks/p3/cli_folders.py`, dossiers d'images comme un utilisateur, `--no-int8`) sur YOLO26-N : l'original est jugé inexact par l'AP (32,4 contre 36,4 sur CPU, accord 0,819) ; la sélection sur CPU est acceptée après vérification de l'AP (36,6) ; 25,8 → 8,45 ms (3,05×). Le déploiement rechargé (`npu+cpu`) donne un accord de 0,995 avec le CPU FP32 sur 20 autres images.
+
+**P3.4 — banc des détecteurs (par paquets).** Résultats dans `runs/p3/optimize_*.json`, AP rapportée sur val2017 [0, 500).
+
+| Modèle | Avant | Après | Appliqué | AP val2017 : CPU / avant / après | Paquet |
+|---|---|---|---|---|---|
+| YOLO26-N FP16 | 26,2 ms (−3,4 AP) | **8,87 ms (2,96×)** | sélection sur CPU | 44,8 / 40,7 / 44,8 | 2 |
+| YOLO26-S FP16 | 33,0 ms, perte du NPU | **13,7 ms (2,40×)** | sélection sur CPU + INT8 mixte | 50,8 / plante / 50,6 | P3.2 |
+| D-FINE-N FP16 | 26,0 ms (−0,25 AP, borne −0,64) | **15,4 ms (1,69×)** | décodeur sur iGPU | 45,8 / 45,6 / 45,6 | 3 |
+| D-FINE-S FP16 | 47,0 ms (accord 0,909) | **34,7 ms (1,36×)** | décodeur sur iGPU | 51,6 / 51,2 / 51,5 | 1 |
+| DEIMv2-N FP16 | 23,9 ms (−0,72 AP) | **13,1 ms (1,82×)** | décodeur sur iGPU | 46,7 / 45,7 / 46,6 | 3 |
+| RT-DETRv2-R18 FP16 | 47,5 ms (−2,9 AP) | **29,0 ms (1,64×)** | coupe à `model.enc_output` vers l'iGPU + INT8 (schéma transformer) | 50,8 / 48,0 / 50,7 | 3 (paquet 2 : 43,3 ms) |
+| RF-DETR-N FP16 | 82,9 ms | **37,4 ms (2,22×)** | décodeur sur iGPU + INT8 mixte (schéma transformer, 3 petites têtes en flottant) | 51,4 / 51,3 / 51,1 | 2 |
+
+Corrections de méthode en cours de route (toutes avant d'être appliquées au paquet suivant) :
+1. **Budget d'AP jugé sur 200 images trompeur** (paquet 1) : la précision mixte de YOLO26-N passait à −0,3 point sur 200 images mais perdait 0,9 point sur les 500 du rapport. Désormais : 500 images (val2017 [2500, 3000)), AP calculée sur 10 tranches de 50 images pour le candidat et pour le CPU FP32, **test de non-infériorité apparié** (perte inférieure au budget au seuil de 5 %), aussi pour juger l'original et les réparations. Avec lui, le mélange de YOLO26-N (−0,37 point, borne à −1,2) est refusé et la sélection sur CPU acceptée (+0,01 ± 0,08).
+2. **Test bilatéral trop strict** (paquet 2) : la question « la perte reste-t-elle sous le budget ? » est unilatérale. Le seuil est désormais `t(0,95)` au lieu de `t(0,975)`. Règle fixée pour la suite et pour l'article. RT-DETRv2 + INT8 (34,7 ms, −0,19 point) aurait été accepté avec cette règle ; il sera refait au paquet 3.
+3. **Candidats approchés essayés sur un état inexact** (paquet 2, RT-DETRv2) : temps perdu dans une recherche de précision mixte sans objet. Désormais, les candidats approchés attendent que l'état soit réparé. (Remplacée au passage au NPU seul, ci-dessous : ils peuvent réparer, mais sans recherche de précision mixte sur un état inexact.)
+4. **Coupe hybride au TopK sous-optimale pour les DETR** : RT-DETRv2 décodeur sur iGPU à 43,3 ms contre 33,9 ms en L4, où la coupe était à la fin de l'encodeur (les têtes de l'encodeur et une LayerNorm sur 8 400 tokens restent sinon sur le NPU). Ajout de candidats de coupe aux frontières des grands modules avant la sélection (`optimizer._boundaries` : `enc_output`, `enc_score_head`…).
+5. **Quantificateurs hors groupes jamais remis en flottant** (paquet 3, D-FINE-N) : `quantizable_groups` ajoute un groupe `(rest)`, les ops des régions sans op lourde, évalué et choisi comme les autres. Sur D-FINE-N : 17 groupes dont `(rest)` (182 ops) ; tous en flottant, il ne reste plus aucun FakeQuantize (64 avant). À relancer : D-FINE-N, DEIMv2-N, D-FINE-S.
+
+Observations :
+- **L'INT8 corrige le défaut 2 tuiles de RT-DETRv2** : en INT8 (schéma transformer), l'original en 2 tuiles n'est plus qu'à −0,29 point du CPU, contre −2,9 en FP16. Le compilateur prend d'autres décisions de découpage de l'attention.
+- **D-FINE-S** : l'INT8 complet gagne 5,6 ms mais perd 6 points ; garder 7 groupes sur 16 en flottant n'en récupère que 2. Lu d'abord comme une perte diffuse ; le paquet 3 montre plutôt une limite de l'outil (ci-dessous).
+- **Limite de la précision mixte : les quantificateurs hors groupes (paquet 3).** Sur D-FINE-N, l'INT8 complet perd 5,7 points et garder **18 groupes sur 20** en flottant laisse encore −3,1 points. Vérification sur CPU : avec tous les groupes en flottant, il reste **64 FakeQuantize**, presque tous sur des ops de premier niveau du décodeur (`decoder/aten::{select,mul,add,sub,stack}`, l'arithmétique des points de référence et des boîtes), que `quantizable_groups` ne couvre pas, faute d'op lourde dans ces régions. La perte vient très probablement de là, pas des modules. Probablement la même cause pour DEIMv2-N (INT8 −6,5 points ; 8 groupes sur 11 en flottant laissent −0,43 point, borne −1,1) et pour D-FINE-S. Corrigé (correction 5).
+- **RT-DETRv2 (paquet 3)** : la coupe aux frontières trouve `model.enc_output` (37,4 ms, AP +0,00 point), puis l'INT8 transformer sur cet état passe le test de non-infériorité de justesse (−0,20 point, borne −0,50) : 29,0 ms, −0,07 point sur le rapport. L'INT8 CNN perd 2,6 points.
+- **La précision mixte peut accélérer un état hybride** : sur DEIMv2-N et D-FINE-N, une partie du décodeur tourne sur l'iGPU ; garder `decoder.decoder` / `decoder.layers` en flottant fait **gagner** 0,35 à 0,87 ms (les FakeQuantize coûtent sur l'iGPU), et l'INT8 transformer y coûte +10,8 à +11 ms.
+- **Coupe aux frontières vs coupe au TopK** : seule RT-DETRv2 profite d'une coupe plus haute ; sur D-FINE-N et DEIMv2-N, le décodeur sur iGPU (coupe au premier TopK) reste le meilleur.
+- **RF-DETR-N : la précision mixte n'est pas additive sur ce NPU.** Avec le schéma CNN (−4,2 points), l'affinage descend jusqu'aux 12 couches du backbone DINOv2 : garder **toute** la pile d'encodeurs en flottant coûte +4,2 ms, mais garder **une seule** couche du milieu (1 à 3) en flottant au milieu de couches INT8 coûte +13 à +16 ms (la couche 0 seule : +0,18 ms). Les conversions de précision et le découpage en tuiles entre couches de précisions différentes coûtent plus que le calcul. Les modèles de coût additifs des méthodes de précision mixte (HAQ…) supposent le contraire ; seule la mesure du mélange complet est fiable. Le schéma transformer, lui, ne perd que 0,4 point : le mélange retenu (3 petites têtes en flottant) est à −0,17 point.
+- Coût : ~2 h 30 pour le paquet 2, dont ~1 h 15 pour RF-DETR-N (trois niveaux d'affinage, 20 groupes évalués sur 500 images). ~2 h 20 pour le paquet 3 (RT-DETRv2 45 min, DEIMv2-N 35 min, D-FINE-N 1 h).
+
+**Passage au NPU seul (2026-10-29, après le paquet 3).** Les résultats des paquets 1 à 3 sont déplacés dans `runs/p3/offload-gpu-cpu/` : ils serviront de comparaison (P5). Changements de l'optimiseur :
+- `optimize(..., offload=())` par défaut : seule une sélection finale légère va sur le CPU ; décodeur et coupes aux frontières seulement vers les appareils de `offload` (`--offload gpu` dans la CLI et le banc, résultats dans `runs/p3/offload-<appareils>/`).
+- **Les candidats approchés peuvent réparer** un état inexact (jugés par l'AP contre le CPU FP32, comme toujours), puisque l'INT8 supprime le défaut 2 tuiles de RT-DETRv2 ; la recherche de précision mixte reste réservée aux états exacts. Cela remplace la correction 3.
+- **Nouvelle réparation exacte sans quitter le NPU : `decoder-on-1-tile`**, le décodeur compilé à part sur 1 tuile, le reste sur 2 (`State.offload_config`). Mesuré sur RT-DETRv2 FP16 (30 images de garde) :
+
+| RT-DETRv2 FP16 sur NPU | Latence | Accord |
+|---|---|---|
+| original, 2 tuiles | 47,1 ms | 0,721 |
+| découpé au TopK, les deux parties sur 2 tuiles | 56,0 ms | 0,721 |
+| tête sur 1 tuile, décodeur sur 2 | 72,3 ms | 0,721 |
+| **décodeur sur 1 tuile, tête sur 2** | 75,4 ms | **0,995** |
+| tout sur 1 tuile | 80,6 ms | 0,995 |
+
+  Le défaut est bien dans le décodeur, mais la réparation est chère : découper le graphe en deux inférences NPU coûte à lui seul +8,9 ms, et le décodeur sur 1 tuile +19 ms. Elle ne bat `tiles=1` que de 5 ms ; la mesure départagera avec l'INT8 transformer en 2 tuiles.

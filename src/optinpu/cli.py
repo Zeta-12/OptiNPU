@@ -87,6 +87,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="COCO-format set judging INT8 and repairs by AP (not the images you report on)")
     o.add_argument("--ap-budget", type=float, default=0.5, help="AP points an approximate rewrite may cost")
     o.add_argument("--no-int8", action="store_true", help="do not try INT8 quantization")
+    o.add_argument("--offload", default="", help="devices that may run a heavy tail such as a DETR decoder "
+                                                 "(gpu,cpu); default: only the final selection leaves the NPU")
     o.add_argument("--task", default="optinpu", choices=["optinpu", "detr", "dets"],
                    help="output format of a detector given as a file")
     o.add_argument("--letterbox", action="store_true", help="YOLO-style pre-processing (file models)")
@@ -219,7 +221,8 @@ def main(argv: list[str] | None = None) -> None:
             task, samples = OutputTask(), random_samples(model, args.samples)
         calibration = images(args.calibration, 300) if args.calibration else None
         report = optimize(model, task, samples, min_agreement=args.min_agreement, calibration=calibration,
-                          evaluation=evaluation, ap_budget=args.ap_budget / 100, int8=not args.no_int8)
+                          evaluation=evaluation, ap_budget=args.ap_budget / 100, int8=not args.no_int8,
+                          offload=tuple(d for d in args.offload.split(",") if d))
         print(report)
         if args.out:
             print(f"\nreport and optimized deployment written to {report.save(args.out, f'{args.model} on the NPU')}")
