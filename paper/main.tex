@@ -21,8 +21,8 @@
 \title{Measure, Don't Predict: Accuracy-Guarded Latency\\Optimization of Object Detectors on a Client NPU}
 
 \author{\IEEEauthorblockN{Julien Beloin}
-\IEEEauthorblockA{\todo{affiliation}\\
-\todo{e-mail}}}
+\IEEEauthorblockA{Independent researcher\\
+\url{https://github.com/Zeta-12/OptiNPU}}}
 
 \maketitle
 
@@ -55,7 +55,7 @@ We take the opposite approach: \emph{measure, don't predict}. One property of th
 \item a measured profiler, based on region bypassing and paired, randomized, adaptive rounds, which picks better interventions than vendor counters and an additive cost model on 150 interventions over five models (Section~\ref{sec:eval-profiler});
 \item a task-level accuracy guard that combines detection agreement and a paired non-inferiority test on AP, calibrated on real compiler failures (Section~\ref{sec:guard});
 \item a three-tier optimizer (exact, approximate, retraining), with a latency-guided mixed-precision search that does not assume additive costs, evaluated on seven detectors and three image classifiers (Sections~\ref{sec:optimizer}, \ref{sec:eval-optimizer} and~\ref{sec:eval-classifiers});
-\item an open-source implementation (Apache-2.0) in which every compilation and inference runs in a watched child process. \todo{repository URL}
+\item an open-source implementation (Apache-2.0), available at \url{https://github.com/Zeta-12/OptiNPU}, in which every compilation and inference runs in a watched child process.
 \end{enumerate}
 
 % =====================================================================================================
@@ -64,7 +64,7 @@ We take the opposite approach: \emph{measure, don't predict}. One property of th
 
 \subsection{The Intel NPU 3720}
 
-The NPU of the Intel Core Ultra~5 235U has two neural compute tiles. Each tile has DPU arrays, which run convolutions and matrix products, SHAVE DSP cores, which run the other operations, and DMA engines. OpenVINO~\cite{openvino} compiles a whole graph for it, in FP16 or INT8, and the \texttt{NPU\_TILES} option selects one or two tiles (two by default). On dense $3\times3$ convolutions we measure 4 to 6 effective TOPS per layer, for a nominal peak of 6.1 (FP16) and 12.3 (INT8). The NPU only runs inference.
+The NPU of the Intel Core Ultra~5 235U has two neural compute tiles. Each tile has DPU arrays, which run convolutions and matrix products, SHAVE DSP cores, which run the other operations, and DMA engines. OpenVINO~\cite{openvino} compiles a whole graph for it, given in its intermediate representation (IR: an XML graph and a binary file of weights), in FP16 or INT8, and the \texttt{NPU\_TILES} option selects one or two tiles (two by default). On dense $3\times3$ convolutions we measure 4 to 6 effective TOPS per layer, for a nominal peak of 6.1 (FP16) and 12.3 (INT8). The NPU only runs inference.
 
 \subsection{Today's detectors on this NPU}
 
@@ -231,7 +231,7 @@ YOLO26-N & $-4.6$ & 0.842 & 0.989 \\
 \end{equation}
 We use $B = 0.5$~AP. For a classifier, the same test applies to top-1 accuracy on a labeled set, with the same budget in accuracy points. This test decides whether the original deployment, a repair or an approximation counts as exact; agreement only decides when there are no annotations.
 
-\textbf{Test power.} The number of images matters in both directions. A point estimate on 200 images accepted a mixed-precision YOLO26-N within 0.3 points of the reference, which then lost 0.9 points on the report images; with the test, the same mix ($-0.37$ points, lower bound $-1.2$) is rejected. Conversely, 10 folds of 50 images left a margin of about 0.4 points: D-FINE-N's 0.25-point loss had a lower bound of $-0.64$, so the optimizer paid 15\ms{} to repair a loss within the budget. With 20 folds, the margin is about 0.25 points. \todo{measured margin with 20 folds.}
+\textbf{Test power.} The number of images matters in both directions. A point estimate on 200 images accepted a mixed-precision YOLO26-N within 0.3 points of the reference, which then lost 0.9 points on the report images; with the test, the same mix ($-0.37$ points, lower bound $-1.2$) is rejected. Conversely, 10 folds of 50 images left a margin of about 0.4 points: D-FINE-N's 0.25-point loss had a lower bound of $-0.64$, so the optimizer paid 15\ms{} to repair a loss within the budget. With 20 folds, the measured margins are 0.25 to 0.37 points: D-FINE-N's original deployment ($-0.18$, lower bound $-0.44$) is now exact.
 
 \subsection{Optimizer}
 \label{sec:optimizer}
@@ -308,19 +308,11 @@ Retraining & SiLU/HardSwish/GELU $\to$ ReLU; LayerNorm $\to$ BatchNorm; 50\,\% a
 \item one group per module region that contains a convolution or a matrix product, with about ten groups in total;
 \item one group, \emph{rest}, for every other quantized operation. Without it, quantizers on a DETR decoder's box arithmetic can never return to float (Section~\ref{sec:case-mixed}).
 \end{itemize}
-Each group is kept alone in float on top of full INT8, quantized with 64 calibration images. Its AP gain is measured on the annotated set, and its latency cost in a paired session against full INT8. If the most useful group costs more than a quarter of the INT8 saving, it is split into its sub-modules and measured again, up to three times. Groups are then ranked by AP gained per millisecond. Growing mixes are quantized with all 300 calibration images and \emph{verified as a whole}, for latency and with Eq.~(\ref{eq:noninf}). The search stops at the first mix that passes, or when adding float groups removes the significant gain. We never assume that the latency of a mix is the sum of its groups' costs.
+Each group is kept alone in float on top of full INT8, quantized with 64 calibration images. Its AP gain is measured on the annotated set, and its latency cost in a paired session against full INT8. Among the groups that cost more than a quarter of the INT8 saving, the most useful one that can be split is split into its sub-modules and measured again, up to three times. Groups are then ranked by AP gained per millisecond. Growing mixes are quantized with all 300 calibration images and \emph{verified as a whole}, for latency and with Eq.~(\ref{eq:noninf}). The search stops at the first mix that passes, or when adding float groups removes the significant gain. We never assume that the latency of a mix is the sum of its groups' costs.
 
 \subsection{Implementation}
 
-\tool{} is a Python library and command-line tool (\texttt{optinpu profile}, \texttt{optinpu optimize}) built on OpenVINO 2026.4.1 and NNCF 3.4. The core modules (profiler, optimizer, rewrites, sandbox, tasks, graph utilities) take about 2\,350 lines; the test suite has 91 tests.
-
-\textbf{Sandbox.} Every compilation and inference runs in a child process watched for memory and time; on failure, the whole process tree is killed. This protection is necessary on this NPU:
-\begin{itemize}
-\item the compiler reached 53 to 55\,GB of virtual memory on some graphs and exhausted the machine;
-\item a lost device must not take down the tool; it is turned into a rejected candidate.
-\end{itemize}
-
-\textbf{Output.} The optimized deployment is saved as IR parts and a JSON file (devices, compile options, applied changes), with a Markdown and JSON report.
+\tool{} is a Python library and command-line tool (\texttt{optinpu profile}, \texttt{optinpu optimize}) built on OpenVINO and NNCF. Every compilation and inference runs in a child process watched for memory and time, whose whole process tree is killed on failure. On this NPU, the compiler reached 53 to 55\,GB of virtual memory on some graphs, and a lost device must become a rejected candidate rather than a crash of the tool. The optimized deployment is saved as IR parts with a JSON description (devices, compile options, applied changes) and a report.
 
 % =====================================================================================================
 \section{Evaluation}
@@ -430,7 +422,6 @@ RF-DETR-N & 82.9\ms{} & \todo{P3.5} & & 51.4 / 51.3 / \todo{} \\
 \end{itemize}
 \todo{D-FINE-S and RF-DETR-N (P3.5, batch 2).}
 
-\textbf{Cost of the search.} The search takes 35 to 75 minutes per DETR, and 70 minutes for YOLO26-S, mostly in CPU-side quantization and AP evaluation.
 
 \subsection{Beyond detection: image classifiers}
 \label{sec:eval-classifiers}
@@ -491,7 +482,7 @@ The profiler attributes 72\,\% of the latency (18.6\ms{}) to the head. The vendo
 
 \textbf{Latency is not additive.} On RF-DETR-N, whose backbone runs on the NPU, NNCF's CNN scheme loses 4.2~AP, and the optimizer refined the search down to the 12 DINOv2 layers. Keeping the \emph{whole} encoder stack in float costs 4.2\ms{}. Keeping a \emph{single} middle layer in float, between INT8 layers, costs 13 to 16\ms{}. Precision changes and the re-tiling between layers of different precisions cost more than the arithmetic. A cost model that sums per-layer costs would choose the single layer; measuring the whole mix avoids that mistake.
 
-\textbf{Module groups miss operations.} On D-FINE-N, keeping 18 of 20 module groups in float still left a 3.1-point loss. With every group in float, 64 quantizers remained, almost all on the decoder's box and reference-point arithmetic, which belongs to no module containing a convolution. The \emph{rest} group fixes this. \todo{Effect of the \emph{rest} group on D-FINE and DEIMv2 (P3.5).}
+\textbf{Module groups miss operations.} On D-FINE-N, keeping 18 of 20 module groups in float still left a 3.1-point loss. With every group in float, 64 quantizers remained, almost all on the decoder's box and reference-point arithmetic, which belongs to no module containing a convolution. The \emph{rest} group fixes this, and it becomes the most useful group of D-FINE-N: keeping it in float recovers 2.85~AP and even saves 0.47\ms{}.
 
 \subsubsection{Repairing on the NPU}
 On RT-DETRv2, the two-tile fault sits in the decoder's self-attention. Rewriting the attention in the IR changes nothing, because the compiler normalizes all its variants. Compiling the decoder apart on one tile, with the rest on two, repairs the model on the NPU (Table~\ref{tab:split}). The repair is expensive, however:
@@ -527,7 +518,7 @@ Thanks to the premise, \tool{} reports the exact latency of rewrites that need r
 \item pruning 50\,\% of the weights would make ResNet-50 25\,\% faster (Table~\ref{tab:premise});
 \item on the DETR models measured so far, these rewrites bring at most 5\,\%.
 \end{itemize}
-\todo{Recovery by distillation from the original model without labels, then QAT (P4); AP after recovery.}
+\tool{} does not retrain the model itself. It tells which retraining is worth its cost before any training is run: a 25\,\% gain justifies fine-tuning YOLO26 with ReLU, a 5\,\% gain hardly justifies retraining a DETR. Recovering the accuracy is then a matter of the user's own training pipeline, for instance by distillation from the original model.
 
 % =====================================================================================================
 \section{Discussion and Limitations}
@@ -543,7 +534,7 @@ Thanks to the premise, \tool{} reports the exact latency of rewrites that need r
 \item the non-inferiority test uses 1\,000 images; the report uses 500 others, not the full val2017. \todo{report on full val2017.}
 \end{itemize}
 
-\textbf{Greedy search.} The search applies one change at a time, so it can miss combinations that only pay off together. Each step costs a few minutes of NPU time and, with INT8, tens of minutes of CPU-side quantization and evaluation.
+\textbf{Cost of the search.} The search applies one change at a time, so it can miss combinations that only pay off together. Each step costs a few minutes of NPU time; with INT8, the mixed-precision search adds CPU-side quantizations and one AP evaluation per group. A whole search takes from 35 minutes (RT-DETRv2) to 1~h~45 (D-FINE-N) on our laptop. \todo{final timings over all models (P3.5).}
 
 \textbf{Scope.} We optimize detectors, the most demanding case, because accuracy is task-level and models use data-dependent operations, and classifiers, judged by top-1. Other models can use the generic output-agreement task, without a metric test.
 

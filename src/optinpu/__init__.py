@@ -15,7 +15,7 @@ from optinpu.postprocess import Detections  # noqa: E402
 from optinpu.profiler import profile_measured  # noqa: E402
 from optinpu.optimizer import optimize  # noqa: E402
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Detector",

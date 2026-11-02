@@ -166,6 +166,7 @@ Protocole : la recherche (choix des réécritures) se fait sur des images de tra
 - **Travaux à situer** : nn-Meter, NetAdapt, HAQ, MobileDets, EfficientNet-EdgeTPU, HOT (Samsung), Grassroots Operator Search (IBM, DATE 2025), optimiseur de graphe d'Arm, TASO / PET, tests de compilateurs DL (NNSmith).
 - **Limite assumée** : un seul NPU (3720, pilote 32.0.100.4778).
 - **Cible** : à décider (prépublication arXiv, puis atelier ou revue).
+- **Décisions du 2026-11-02** : publication en nom propre sur LinkedIn (« Independent researcher »), code sur `github.com/Zeta-12/OptiNPU` ; 8 pages conservées ; **P4 abandonné** : le niveau « réentraînement » reste un what-if mesuré (l'outil dit quel réentraînement vaut son coût, la récupération relève de la chaîne d'entraînement de l'utilisateur) ; déclaration d'usage d'IA à décider plus tard.
 - **V0** (2026-10-30) : `paper/main.tex` + `references.bib`, template IEEEtran (conférence), en anglais, environ 5 400 mots (au-delà des 6 pages habituelles). Écrit pour vérifier la maturité de l'outil et des résultats ; tout ce qui manque est marqué `\todo{}` en rouge (31 marques), surtout les résultats DETR en NPU seul (P3.5), la récupération après réentraînement (P4), la campagne sur machine au repos et l'AP sur val2017 complet (P5). Les chiffres de validation du profileur sont recalculés sans OptiDet (5 modèles, 150 interventions, 73 significatives).
 
 ---
@@ -674,5 +675,9 @@ Observations :
 - Coût : ~3 h 15 pour le paquet (RT-DETRv2 ~35 min, D-FINE-N ~1 h 45 dont la recherche de précision mixte, DEIMv2-N ~1 h).
 
 **Exemple utilisateur** (`examples/profile_and_optimize.py`, ~1 min 40 sur le NPU, ~1 min 10 sur CPU, rien à télécharger) : faux détecteur 320 px (SiLU, depthwise, LayerNorm sur 6 400 tokens, top-300 dans le graphe), poids aléatoires, garde sur les sorties brutes. Sur le NPU : accord 1,000 ; poids aléatoires −0,1 ms (top-k dépendant des données), 50 % de zéros +0,55 ms (plus lent) ; profil : la LayerNorm coûte 41 % ; optimisation 4,28 → 2,83 ms (INT8 puis sélection sur CPU) ; recommandations SiLU → ReLU −14,5 %, LayerNorm → BatchNorm −12,3 % ; déploiement rechargé (NPU + CPU), accord 0,998. Au passage, `tiles=1/2` n'est plus proposé hors NPU.
+
+**Campagne de nuit** (`benchmarks/p3/campaign.py`) : YOLO26-N, YOLO26-S, D-FINE-S, RF-DETR-N puis les 3 classifieurs, à la suite ; garde Windows éveillé, attend le secteur avant chaque modèle, un journal par modèle (`runs/p3/campaign/`), reprise possible, résumé `summary.md`. Chemin classification vérifié sur NPU avant (ResNet-50 : accord top-1 1,0 ; top-1 69,5 % en FP16 et en INT8 sur 200 images).
+
+**Lib 0.2.0 (2026-11-02)** : tests des règles de décision sur un faux NPU (`tests/test_optimizer.py` : réparation par l'INT8, précision mixte sur un état presque dans le budget, exactitude par la métrique) ; CLI `--task classification --labels DOSSIER --resize --interpolation --folds` ; README (classifieurs, garde par la métrique, chiffres du profileur sur 5 modèles) ; 98 tests.
 
 **Correction 8 — affinage de la précision mixte.** Seul le groupe le plus utile était découpé ; quand c'est `(rest)` (indécoupable), l'affinage s'arrêtait (D-FINE-N : backbone jamais découpé). Désormais : le plus utile des groupes coûteux (plus d'un quart du gain INT8) et découpables. Sans effet attendu sur D-FINE-N (gain INT8 total de 0,3 ms).

@@ -31,6 +31,8 @@ accuracy. Every number is a measurement on the device, never an estimate.
 optinpu profile yolo26n.xml --measured
 optinpu optimize yolo26n.xml --task dets --letterbox --images guard_images/ \
     --annotations instances.json images/ --calibration calib_images/ --out yolo26n_npu/
+optinpu optimize resnet50.xml --task classification --images guard_images/ \
+    --labels labeled/ --calibration calib_images/ --out resnet50_npu/     # labeled/<class index>/<image>
 ```
 
 ```python
@@ -55,12 +57,14 @@ and reloads the saved deployment.
 
 **Profiler** (`profile_measured`, `optinpu profile --measured`). For each module region and each op type,
 the latency saved when it is bypassed, measured in paired, randomized rounds until the 95 % confidence
-interval is narrow. The NPU's own counters overlap (they sum to 3-10x the real latency) and an additive
-per-op cost model ignores fusions: on 6 models, acting on their first pick loses 26 % and 40 % of the
-best possible saving, against 0 % for the measured profile.
+interval is narrow. The NPU's own counters overlap (they sum to several times the real latency) and an
+additive per-op cost model ignores fusions: on 5 models, acting on their first pick loses 31 % and 32 %
+of the best possible saving, against at most 1 % for the measured profile.
 
 **Optimizer** (`optimize`, `optinpu optimize`). A greedy loop over measured candidates, each checked for
-accuracy against the CPU FP32 original (detection F1 on guard images, or COCO AP on an annotated set):
+accuracy against the CPU FP32 original: agreement on guard images (detection F1, same top-1 class, or
+raw outputs) and, with an annotated set, COCO AP or top-1 accuracy, judged by a paired non-inferiority
+test over folds of images (the loss must stay within the budget with 95 % confidence):
 
 | Kind | Rewrites |
 |---|---|
@@ -213,6 +217,6 @@ tile is exact but slower; `npu+gpu` is both exact and the fastest.
 ## Tests
 
 ```
-.venv\Scripts\python -m pytest       # 94 tests, ~1 min; NPU tests are skipped without an NPU
+.venv\Scripts\python -m pytest       # 98 tests, ~2 min; NPU tests are skipped without an NPU
 .venv\Scripts\ruff check src tests examples
 ```

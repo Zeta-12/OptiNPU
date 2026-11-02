@@ -197,6 +197,34 @@ def test_sandboxed_top1_matches_in_process(tmp_path):
     assert len(result["fold_scores"]) == 10 and len(expected["fold_top1"]) == 4
 
 
+def test_cli_optimizes_a_classifier_judged_by_top1(tmp_path, monkeypatch):
+    import openvino as ov
+
+    import optinpu.optimizer
+    from optinpu.cli import main
+    from optinpu.data.imagenet import LabeledImages
+    from optinpu.tasks import ClassificationTask
+
+    torch.manual_seed(0)
+    ov.save_model(load_model(TinyClassifier(), (1, 3, 32, 32)), tmp_path / "cls.xml")
+    for folder in ("guard", "labeled/0", "labeled/1"):
+        (tmp_path / folder).mkdir(parents=True)
+        Image.new("RGB", (40, 50)).save(tmp_path / folder / "a.jpg")
+    seen = {}
+
+    def fake_optimize(model, task, samples, **options):
+        seen.update(task=task, samples=samples, **options)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(optinpu.optimizer, "optimize", fake_optimize)
+    with pytest.raises(SystemExit):
+        main(["optimize", str(tmp_path / "cls.xml"), "--task", "classification", "--images", str(tmp_path / "guard"),
+              "--labels", str(tmp_path / "labeled"), "--interpolation", "bicubic", "--folds", "4"])
+    assert seen["task"] == ClassificationTask((32, 32), 37, "bicubic") and len(seen["samples"]) == 1
+    assert isinstance(seen["evaluation"], LabeledImages) and seen["evaluation"].labels == [0, 1]
+    assert seen["folds"] == 4
+
+
 def test_failed_job_reports_the_error(tmp_path):
     job = run_job({"job": "latency", "ir": str(tmp_path / "missing.xml"), "device": "cpu"}, timeout=120)
     assert not job.ok and job.error

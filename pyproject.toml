@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "optinpu"
-version = "0.1.0"
-description = "Train object detectors anywhere, run them on the Intel NPU."
+version = "0.2.0"
+description = "Measured profiling and optimization of models for the Intel NPU, and detector training."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10,<3.14"
-keywords = ["object detection", "npu", "openvino", "intel", "d-fine", "rt-detr"]
+keywords = ["npu", "openvino", "intel", "profiling", "quantization", "object detection", "d-fine", "rt-detr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -28,7 +28,7 @@ dependencies = [
     "torch>=2.5",
     "torchvision",
     "transformers>=4.50",  # pretrained D-FINE / RT-DETRv2 and their training losses
-    "scipy",               # Hungarian matching in DETR losses
+    "scipy",               # Hungarian matching in DETR losses, paired t test of the optimizer
     "pycocotools",
     "psutil",              # memory / time watchdog of sandboxed NPU compilations
 ]

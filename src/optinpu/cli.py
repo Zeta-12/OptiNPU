@@ -79,18 +79,23 @@ def main(argv: list[str] | None = None) -> None:
 
     o = sub.add_parser("optimize", help="measured rewrites that cut NPU latency without accuracy loss")
     o.add_argument("model", help="registered model name, or path to an OpenVINO .xml / ONNX file")
-    o.add_argument("--images", help="folder of sample images for the accuracy guard (detectors); "
+    o.add_argument("--images", help="folder of sample images for the accuracy guard (detectors, classifiers); "
                                     "without it, raw outputs on random inputs are compared")
     o.add_argument("--samples", type=int, default=30, help="guard images taken from --images")
     o.add_argument("--calibration", help="folder of images for INT8 calibration (300 used; default: the guard images)")
     o.add_argument("--annotations", nargs=2, metavar=("JSON", "IMAGES"),
                    help="COCO-format set judging INT8 and repairs by AP (not the images you report on)")
-    o.add_argument("--ap-budget", type=float, default=0.5, help="AP points an approximate rewrite may cost")
+    o.add_argument("--labels", metavar="FOLDER",
+                   help="classifiers: FOLDER/<class index>/<image> judging INT8 and repairs by top-1 accuracy")
+    o.add_argument("--folds", type=int, default=20, help="folds of the annotated set for the paired test (~50 images each)")
+    o.add_argument("--ap-budget", type=float, default=0.5, help="AP (or top-1) points an approximate rewrite may cost")
     o.add_argument("--no-int8", action="store_true", help="do not try INT8 quantization")
     o.add_argument("--offload", default="", help="devices that may run a heavy tail such as a DETR decoder "
                                                  "(gpu,cpu); default: only the final selection leaves the NPU")
-    o.add_argument("--task", default="optinpu", choices=["optinpu", "detr", "dets"],
-                   help="output format of a detector given as a file")
+    o.add_argument("--task", default="optinpu", choices=["optinpu", "detr", "dets", "classification"],
+                   help="output format of a detector given as a file, or an ImageNet-style classifier")
+    o.add_argument("--resize", type=int, help="classifiers: shorter side before the center crop (default: 8/7 of it)")
+    o.add_argument("--interpolation", default="bilinear", choices=["bilinear", "bicubic"], help="classifiers")
     o.add_argument("--letterbox", action="store_true", help="YOLO-style pre-processing (file models)")
     o.add_argument("--imagenet-norm", action="store_true", help="ImageNet mean / std normalization (file models)")
     o.add_argument("--min-agreement", type=float, default=0.95)
@@ -196,7 +201,7 @@ def main(argv: list[str] | None = None) -> None:
 
         from optinpu.export import load_model
         from optinpu.optimizer import optimize
-        from optinpu.tasks import DetectionTask, OutputTask, random_samples
+        from optinpu.tasks import ClassificationTask, DetectionTask, OutputTask, random_samples
 
         model = load_model(_model_file(args.model, "fp16"))
         images = lambda folder, n: sorted(p for p in Path(folder).iterdir()
@@ -204,7 +209,13 @@ def main(argv: list[str] | None = None) -> None:
         evaluation = None
         if args.images:
             shape = model.inputs[0].get_partial_shape().to_shape()
-            if Path(args.model).suffix in (".xml", ".onnx"):
+            if args.task == "classification":
+                task = ClassificationTask((shape[2], shape[3]), args.resize or round(shape[2] * 8 / 7), args.interpolation)
+                if args.labels:
+                    from optinpu.data import labeled_folder
+
+                    evaluation = labeled_folder(args.labels)
+            elif Path(args.model).suffix in (".xml", ".onnx"):
                 imagenet = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) if args.imagenet_norm else (None, None)
                 task = DetectionTask((shape[2], shape[3]), args.task, "letterbox" if args.letterbox else "stretch",
                                      *imagenet)
@@ -221,8 +232,8 @@ def main(argv: list[str] | None = None) -> None:
             task, samples = OutputTask(), random_samples(model, args.samples)
         calibration = images(args.calibration, 300) if args.calibration else None
         report = optimize(model, task, samples, min_agreement=args.min_agreement, calibration=calibration,
-                          evaluation=evaluation, ap_budget=args.ap_budget / 100, int8=not args.no_int8,
-                          offload=tuple(d for d in args.offload.split(",") if d))
+                          evaluation=evaluation, ap_budget=args.ap_budget / 100, folds=args.folds,
+                          int8=not args.no_int8, offload=tuple(d for d in args.offload.split(",") if d))
         print(report)
         if args.out:
             print(f"\nreport and optimized deployment written to {report.save(args.out, f'{args.model} on the NPU')}")
