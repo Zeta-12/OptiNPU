@@ -14,12 +14,13 @@ from PIL import Image, ImageEnhance
 class CocoDetection(torch.utils.data.Dataset):
     """COCO-format detection dataset.
 
-    Returns (pixels (3, H, W) float in [0, 1], target) with target = {
+    Returns (pixels (3, H, W) uint8, target) with target = {
         "class_labels": (N,) contiguous class indices,
         "boxes": (N, 4) normalized cxcywh,     # the format DETR losses expect
         "image_id": int,
     }
-    Images are resized (stretched) to `imgsz`, as at inference time.
+    Images are resized (stretched) to `imgsz`, as at inference time. Models take float pixels in [0, 1]:
+    the training engine scales the uint8 ones on its device.
     """
 
     def __init__(
@@ -84,11 +85,14 @@ class CocoDetection(torch.utils.data.Dataset):
             if random.random() < 0.5:
                 image = image.transpose(Image.FLIP_LEFT_RIGHT)
                 boxes[:, 0] = w - boxes[:, 0] - boxes[:, 2]
-            for enhancer in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
-                image = enhancer(image).enhance(random.uniform(0.7, 1.3))
 
         image = image.resize((self.imgsz[1], self.imgsz[0]), Image.BILINEAR)
-        pixels = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        if self.augment:
+            # after the resize: the same jitter (up to rounding) on fewer pixels; it was 41 % of the loading time
+            for enhancer in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
+                image = enhancer(image).enhance(random.uniform(0.7, 1.3))
+        # uint8: 4x less to pass from the workers, scaled to [0, 1] on the training device (engine)
+        pixels = torch.from_numpy(np.array(image, dtype=np.uint8)).permute(2, 0, 1)
 
         cxcywh = np.stack([
             (boxes[:, 0] + boxes[:, 2] / 2) / w,

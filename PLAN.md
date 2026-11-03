@@ -646,7 +646,7 @@ Observations :
 
   Le défaut est bien dans le décodeur, mais la réparation est chère : découper le graphe en deux inférences NPU coûte à lui seul +8,9 ms, et le décodeur sur 1 tuile +19 ms. Elle ne bat `tiles=1` que de 5 ms ; la mesure départagera avec l'INT8 transformer en 2 tuiles.
 
-### P3.5 — banc en NPU seul (en cours)
+### P3.5 — banc en NPU seul (terminé)
 
 **Modèles de l'article (décision du 2026-10-30)** : 7 détecteurs, YOLO26-N/S, D-FINE-N/S, DEIMv2-N, RT-DETRv2-R18, RF-DETR-N (DEIMv2-S retiré : export à −4 AP ; RF-DETR-S retiré : 125 ms, redondant avec RF-DETR-N), et **3 classifieurs ImageNet** pour montrer l'outil hors détection : ResNet-50, MobileNetV2, EfficientNet-B0 (poids torchvision, 224 px).
 
@@ -681,3 +681,48 @@ Observations :
 **Lib 0.2.0 (2026-11-02)** : tests des règles de décision sur un faux NPU (`tests/test_optimizer.py` : réparation par l'INT8, précision mixte sur un état presque dans le budget, exactitude par la métrique) ; CLI `--task classification --labels DOSSIER --resize --interpolation --folds` ; README (classifieurs, garde par la métrique, chiffres du profileur sur 5 modèles) ; 98 tests.
 
 **Correction 8 — affinage de la précision mixte.** Seul le groupe le plus utile était découpé ; quand c'est `(rest)` (indécoupable), l'affinage s'arrêtait (D-FINE-N : backbone jamais découpé). Désormais : le plus utile des groupes coûteux (plus d'un quart du gain INT8) et découpables. Sans effet attendu sur D-FINE-N (gain INT8 total de 0,3 ms).
+
+**Campagne, résultats (NPU seul, protocole final ; `runs/p3/optimize_*.json`).** AP des détecteurs sur val2017 [0, 2500) (déploiements reconstruits, voir P5), top-1 des classifieurs sur ImageNetV2 [0, 5000).
+
+| Modèle | Avant | Après | Appliqué | Métrique : CPU / avant / après |
+|---|---|---|---|---|
+| YOLO26-N | 26,6 ms | **9,30 ms (2,86×)** | sélection sur CPU | AP 41,7 / 37,0 / 41,6 |
+| YOLO26-S | 33,1 ms, perte du NPU | **16,2 ms (2,04×)** | sélection sur CPU | AP 49,4 / plante / 49,4 |
+| D-FINE-N | 26,0 ms | 26,0 ms | rien (original exact) | AP 44,5 / 44,3 / 44,3 |
+| D-FINE-S | 46,3 ms | 42,9 ms (1,08×) | INT8 mixte (7 groupes sur 19 en flottant) | AP 50,2 / 50,1 / 49,9 |
+| DEIMv2-N | 24,0 ms | 41,2 ms (0,58×) | réparation : 1 tuile | AP 45,0 / 44,0 / 44,9 |
+| RT-DETRv2-R18 | 47,4 ms | **40,6 ms (1,17×)** | réparation : INT8 transformer | AP 49,7 / 46,0 / 49,6 |
+| RF-DETR-N | 83,4 ms | 81,7 ms (1,02×) | INT8 transformer | AP 50,0 / 50,0 / 49,7 |
+| ResNet-50 | 3,86 ms | **2,41 ms (1,60×)** | INT8 mixte (5 groupes sur 20) | top-1 69,9 / 69,9 / 69,2 |
+| MobileNetV2 | 1,27 ms | **1,04 ms (1,22×)** | INT8 mixte (6 groupes sur 20) | top-1 59,5 / 59,5 / 59,6 |
+| EfficientNet-B0 | 2,75 ms | 2,75 ms | rien | top-1 65,8 / 65,8 / 65,8 |
+
+- Durées : YOLO26-N 55 min, YOLO26-S 56, D-FINE-S 67, RF-DETR-N 91, ResNet-50 24, MobileNetV2 13, EfficientNet-B0 12.
+- **Correction 9 — spec du sandbox dans un fichier.** Les 3 classifieurs ont échoué en 0 min au premier passage (WinError 206 : des centaines de chemins d'images dépassent la ligne de commande Windows, 32 767 caractères). La spec passe désormais par `spec.json` ; test de non-régression dans `tests/test_p0.py`.
+- **Biais de sélection (« winner's curse »), ResNet-50.** Le mélange retenu passe sur les images de décision (−0,00, borne −0,49) après quatre mélanges refusés (−0,15 à −0,55), mais perd 0,64 point sur le rapport : garder le premier succès parmi des tests bruités favorise une perte sous-estimée. D-FINE-S n'est probablement pas touché (premier mélange essayé ; −0,27 sur le rapport). Correction possible, non faite : confirmer le mélange choisi sur des images réservées (val2017 [3500, 4500), ImageNetV2 [7600, 10000)). À décider ; elle demanderait de relancer ResNet-50, MobileNetV2 et D-FINE-S.
+
+### P5 — évaluation pour l'article (en cours)
+
+**Déploiements reconstruits (2026-11-03, `benchmarks/p5/deployments.py`).** La campagne gardait les changements appliqués, pas le déploiement. `optimizer.replay` les rejoue (même IR, mêmes 300 images de calibration prises dans l'ordre par NNCF : mêmes graphes INT8) ; le libellé d'un mélange nomme désormais son schéma (`int8-transformer-mixed (…)`) pour que le rejeu soit sans ambiguïté. Les 7 déploiements, sauvegardés dans `runs/p5/deploy/` et rechargés, retrouvent **exactement** l'AP enregistrée sur val2017 [0, 500). AP rapportée désormais sur val2017 [0, 2500) (`runs/p5/report_ap.md`, tableau ci-dessus) ; le banc (`optimize_model.py`) mesure [0, 2500) par défaut et sauvegarde le déploiement et son rapport dans `deploy/<modèle>_<précision>/`. [3500, 4500) reste libre. Sur [0, 2500), le défaut 2 tuiles coûte 4,6 points à YOLO26-N, 3,7 à RT-DETRv2 et 1,0 à DEIMv2-N.
+
+**Décodeur sur iGPU autorisé, protocole final (nuit du 2026-11-02 au 03, `runs/p3/offload-gpu/`, `python -m benchmarks.p3.campaign --offload gpu …`).** Comparaison seulement (tableau VIII de l'article).
+
+| Modèle | Avant (NPU) | Après | Appliqué | AP [0, 2500) : CPU / avant / après | Placement le plus rapide (M0) |
+|---|---|---|---|---|---|
+| D-FINE-N | 26,0 ms | 15,2 ms (1,71×) | décodeur sur iGPU | 44,5 / 44,3 / 44,4 | hybride 15,5 ms |
+| D-FINE-S | 47,0 ms | **30,3 ms (1,55×)** | décodeur sur iGPU + INT8 mixte (6 groupes sur 17) | 50,2 / 50,1 / 50,0 | hybride 34,0 ms |
+| DEIMv2-N | 23,7 ms | 16,6 ms (1,43×) | décodeur sur iGPU | 45,0 / 44,0 / 44,9 | iGPU 15,1 ms |
+| RT-DETRv2-R18 | 47,6 ms | **26,1 ms (1,83×)** | coupe à `model.enc_output` vers l'iGPU + INT8 transformer | 49,7 / 46,0 / 49,6 | hybride 34,9 ms |
+| RF-DETR-N | 83,4 ms | 40,1 ms (2,08×) | décodeur sur iGPU + INT8 transformer | 50,0 / 50,0 / 49,7 | iGPU 23,0 ms |
+
+- Durées : D-FINE-N 104 min, D-FINE-S 78, DEIMv2-N 67, RT-DETRv2 48, RF-DETR-N 94.
+- **D-FINE-S** : avec le décodeur sur l'iGPU, le premier mélange essayé passe (−0,00, borne −0,17 ; −0,19 sur le rapport), 1,13× de plus que le placement hybride seul (34,4 ms). L'outil bat le meilleur placement de M0 sur D-FINE-S et RT-DETRv2 ; il le retrouve sur D-FINE-N ; il reste plus lent que l'iGPU seul sur DEIMv2-N et RF-DETR-N.
+- **Les latences hybrides se reproduisent mal.** Même coupe, même nombre d'ops sur l'iGPU, entre le paquet 3 de P3.4 (2026-10-29, journée, machine utilisée) et cette nuit : DEIMv2-N 13,1 → 16,6 ms, RF-DETR-N 39,4 → 42,5 ms, RT-DETRv2 + INT8 transformer 29,0 → 26,1 ms ; D-FINE-N et D-FINE-S à 0,3 ms près. Les originaux sur NPU varient de moins de 2 % entre les trois passages. Cause non établie (état de l'iGPU ? écran éteint la nuit ?) ; pas de re-mesure faite (PC sur batterie au moment de l'analyse). Écrit tel quel dans l'article : un argument de plus pour garder le réseau sur le NPU.
+
+**Reste à faire en P5** :
+- [ ] Validation du profileur (tableau V) refaite sur machine au repos avec plus de tours : la première (P1.2-P1.3) a tourné PC utilisé, plafonnée à 40 tours. `python -m benchmarks.p1.validate --max-rounds 120 --out runs/p1/validate-p5`, puis `python -m benchmarks.p1.summary runs/p1/validate-p5` (sur les anciens résultats, ce résumé redonne exactement le tableau V). Ensuite, dans l'article : tableau V, paragraphe « Limit » sur MobileNetV2, et préciser que la validation va jusqu'à 120 tours (la méthode dit 40, le défaut de l'outil).
+- [ ] Décider de la correction du biais de sélection (confirmation du mélange sur images réservées) ; si oui, relancer ResNet-50, MobileNetV2 et D-FINE-S.
+- [ ] Mesure d'énergie : possible, script prêt (`python -m benchmarks.p5.energy`, ~1 h, résultats dans `runs/p5/energy.md`). Windows expose les compteurs RAPL (« Energy Meter » : package, cœurs PP0, iGPU PP1 ; en pWh, rafraîchis toutes les ~8 ms, lus par PDH sans droits admin ; pas de canal NPU, il est dans le package ; DRAM à 0). Par déploiement (NPU d'origine, NPU optimisé, NPU+iGPU, iGPU, CPU) : 3 tours de [1 s de pause, 4 s au repos, 8 s d'inférences sur 8 images] ; énergie par inférence = puissance du package × latence, totale et au-dessus du repos. Déploiements de ResNet-50 et MobileNetV2 reconstruits par `replay` dans `runs/p5/deploy/` : top-1 identique à l'enregistré (69,24 et 59,56 %). Ensuite : un tableau ou une phrase dans l'article (NPU contre iGPU et CPU, et NPU+iGPU contre iGPU).
+- [ ] Second NPU ou pilote plus récent.
+- [ ] Une ou deux figures de résultats.
+- [ ] Remerciements et déclaration d'usage d'IA.

@@ -10,14 +10,17 @@ Predictions of each intervention's saving, from the set S of ops it removes:
 - additive: isolated costs summed over S (each op alone on the NPU, minus the cost of a graph made of
   its inputs only): the lookup-table approach of nn-Meter and of hardware-aware NAS.
 Metrics: Spearman rank correlation with the measured savings, mean absolute error, top-3 overlap.
+Windows is kept awake and each model waits for mains power (as benchmarks.p3.campaign); models already in
+--out are skipped.
 
-    python -m benchmarks.p1.validate [model:precision ...]
+    python -m benchmarks.p1.validate [model:precision ...] [--max-rounds 40] [--out runs/p1/validate]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
+from pathlib import Path
 
 import numpy as np
 import openvino as ov
@@ -25,6 +28,7 @@ from scipy.stats import spearmanr
 
 from benchmarks.m0.baselines import ROOT
 from benchmarks.p0.models import all_models
+from benchmarks.p3.campaign import keep_awake, wait_for_mains
 from optinpu.graph import split_from
 from optinpu.profiler import (
     SHAPE_PRESERVING_TYPES,
@@ -43,8 +47,7 @@ from optinpu.rewrites import activations_to_relu, selection_tail, without_norms
 from optinpu.sandbox import run_job
 
 OUT = ROOT / "runs" / "p1" / "validate"
-DEFAULT = ["yolo26-n:fp16", "dfine-n:fp16", "resnet50_640:fp32", "mobilenet_v2_640:fp32", "efficientnet_b0_640:fp32",
-           "optidet-n:int8"]
+DEFAULT = ["yolo26-n:fp16", "dfine-n:fp16", "resnet50_640:fp32", "mobilenet_v2_640:fp32", "efficientnet_b0_640:fp32"]
 ACTIVATIONS = ("Swish", "HSwish", "Gelu", "Mish", "HSigmoid")
 
 
@@ -83,15 +86,18 @@ def interventions(model: ov.Model, max_regions: int = 40) -> dict[str, tuple[lis
     return out
 
 
-def measured_savings(reference: ov.Model, variants: dict, batch: int = 6,
-                     reverse: bool = False) -> tuple[dict[str, float], dict[str, float], float]:
+def measured_savings(reference: ov.Model, variants: dict, batch: int = 6, reverse: bool = False,
+                     max_rounds: int = 40) -> tuple[dict[str, float], dict[str, float], float]:
     """(saving, 95 % half-width, latency): savings paired per round with the full model, rounds repeated
-    until the half-width is below 0.5 % of the latency or 0.02 ms (at most 40 rounds)."""
+    until the half-width is below 0.5 % of the latency or 0.02 ms (at most max_rounds; 15 s per round
+    allowed, as the default 40 rounds in 600 s)."""
     keys = list(variants)[::-1] if reverse else list(variants)
     savings, widths, fulls = {}, {}, []
+    adaptive = Adaptive("full", max_rounds=max_rounds, max_seconds=15 * max_rounds)
     for start in range(0, len(keys), batch):
         chunk = keys[start:start + batch]
-        timings = measure({"full": reference, **{k: variants[k] for k in chunk}}, "npu", adaptive=Adaptive("full"))
+        timings = measure({"full": reference, **{k: variants[k] for k in chunk}}, "npu", adaptive=adaptive,
+                          timeout=adaptive.max_seconds + 1200)
         fulls.append(timings["full"].median_ms)
         for k in chunk:
             savings[k], widths[k] = paired_saving(timings, "full", k)
@@ -129,15 +135,15 @@ def metrics(truth: dict[str, float], predicted: dict[str, float]) -> dict:
             "mae_ms": float(np.mean(np.abs(t - p))), "top3": len(top(truth) & top(predicted)) / 3}
 
 
-def validate(name: str, precision: str) -> dict:
+def validate(name: str, precision: str, max_rounds: int = 40) -> dict:
     entry = next(m for m in all_models() if m.name == name)
     model = ov.Core().read_model(entry.irs[precision])
     reference = reduced_outputs(model)
     found = interventions(model)
     print(f"{name} {precision}: {len(found)} interventions", flush=True)
     variants = {k: v for k, (_, v) in found.items()}
-    run1, ci1, latency = measured_savings(reference, variants)
-    run2, ci2, _ = measured_savings(reference, variants, reverse=True)
+    run1, ci1, latency = measured_savings(reference, variants, max_rounds=max_rounds)
+    run2, ci2, _ = measured_savings(reference, variants, reverse=True, max_rounds=max_rounds)
     truth = {k: float(np.nanmean([run1[k], run2[k]])) for k in found}
 
     job = run_job({"job": "vendor", "ir": model, "device": "npu"}, timeout=900)
@@ -151,7 +157,7 @@ def validate(name: str, precision: str) -> dict:
         "measured (repeat)": run2,
     }
     result = {
-        "model": name, "precision": precision, "latency_ms": latency, "vendor_sum_ms": vendor_total,
+        "model": name, "precision": precision, "max_rounds": max_rounds, "latency_ms": latency, "vendor_sum_ms": vendor_total,
         "additive_sum_ms": sum(cost.values()), "interventions": {
             k: {"ops": len(ops), "run1": run1[k], "run2": run2[k], "ci1": ci1[k], "ci2": ci2[k], "mean": truth[k],
                 **{p: v[k] for p, v in predictions.items()}}
@@ -167,14 +173,24 @@ def validate(name: str, precision: str) -> dict:
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    for spec in sys.argv[1:] or DEFAULT:
-        name, precision = spec.split(":")
-        path = OUT / f"{name}_{precision}.json"
-        if path.exists():
-            print(f"{spec}: already done ({path})", flush=True)
-            continue
-        path.write_text(json.dumps(validate(name, precision), indent=1))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("models", nargs="*", help="model:precision (default: the five of the paper)")
+    parser.add_argument("--max-rounds", type=int, default=40, help="cap of the adaptive rounds")
+    parser.add_argument("--out", type=Path, default=OUT, help="results folder")
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+    keep_awake(True)
+    try:
+        for spec in args.models or DEFAULT:
+            name, precision = spec.split(":")
+            path = args.out / f"{name}_{precision}.json"
+            if path.exists():
+                print(f"{spec}: already done ({path})", flush=True)
+                continue
+            wait_for_mains()
+            path.write_text(json.dumps(validate(name, precision, args.max_rounds), indent=1))
+    finally:
+        keep_awake(False)
 
 
 if __name__ == "__main__":

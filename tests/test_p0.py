@@ -82,6 +82,9 @@ def test_sandboxed_jobs_match_in_process_results():
     model = load_model(_tiny_torch(), (1, 3, 16, 16))
     job = run_job({"job": "latency", "ir": model, "device": "cpu", "iterations": 5}, timeout=120)
     assert job.ok and job.result["latency_ms_median"] > 0, job.error
+    # specs longer than a Windows command line (300 ImageNet paths, ~33k characters)
+    job = run_job({"job": "latency", "ir": model, "device": "cpu", "iterations": 5, "unused": "x" * 40000}, timeout=120)
+    assert job.ok, job.error
 
     samples = random_samples(model, 2)
     outputs, job = run_outputs(model, samples, "cpu", timeout=120)

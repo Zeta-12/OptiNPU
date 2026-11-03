@@ -26,12 +26,16 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=1000, help="steps")
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--amp", action="store_true", help="bf16 autocast")
+    parser.add_argument("--amp", nargs="?", const="bf16", default=False, choices=("bf16", "fp16"),
+                        help="autocast, bf16 by default; fp16 (loss scaling) on GPUs without native bf16, e.g. T4")
+    parser.add_argument("--resume", metavar="LAST_PT", help="continue an interrupted run from its last.pt")
+    parser.add_argument("--max-hours", type=float, help="stop after the last epoch that fits in this time")
     parser.add_argument("--run", default="m2_coco10k")
     parser.add_argument("--distill", metavar="REPO", help="PKD feature distillation from this D-FINE checkpoint, "
                                                           "e.g. ustc-community/dfine-small-coco")
     parser.add_argument("--distill-weight", type=float, default=2.0)
-    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--smoke", nargs="?", type=int, const=30, metavar="STEPS",
+                        help="STEPS steps (default 30) without validation: speed check")
     args = parser.parse_args()
 
     from optinpu.models import get_model
@@ -54,7 +58,7 @@ def main():
         epochs=1 if args.smoke else args.epochs, batch=args.batch, lr=args.lr, backbone_lr=args.backbone_lr,
         weight_decay=args.weight_decay, warmup_steps=args.warmup, clip=10.0, ema_decay=0.9998,
         amp=args.amp, workers=args.workers, log_every=10 if args.smoke else 50,
-        max_steps=30 if args.smoke else None,
+        max_steps=args.smoke, resume=args.resume, max_hours=args.max_hours,
     )
     t = time.time()
     result = model.train(train, None if args.smoke else val, run=args.run + ("_smoke" if args.smoke else ""), **config)

@@ -6,6 +6,7 @@ profiler and the optimizer compile many untested graph variants: each job runs i
 killed past `max_gb` of committed memory, when the system runs low on memory, or past its timeout.
 
     python -m optinpu.sandbox '{"job": "latency", "ir": "model.xml", "device": "npu"}'
+    python -m optinpu.sandbox spec.json
 
 prints one line "RESULT <json>".
 """
@@ -121,7 +122,10 @@ def run_job(spec: dict, timeout: float = 600, max_gb: float = 12.0, echo: bool =
             ov.save_model(spec["ir"], path, compress_to_fp16=False)
             spec["ir"] = str(path)
         spec = {k: str(v) if isinstance(v, Path) else v for k, v in spec.items()}
-        watched = run_watched([sys.executable, "-m", "optinpu.sandbox", json.dumps(spec)], timeout, max_gb,
+        # in a file: hundreds of image paths exceed the Windows command line (32767 characters)
+        spec_file = Path(tmp) / "spec.json"
+        spec_file.write_text(json.dumps(spec), encoding="utf-8")
+        watched = run_watched([sys.executable, "-m", "optinpu.sandbox", str(spec_file)], timeout, max_gb,
                               echo=echo)
     for line in reversed(watched.lines):
         if line.startswith("RESULT "):
@@ -401,5 +405,6 @@ def run_outputs(model, samples: list[list[np.ndarray]], device: str = "npu", con
 
 
 if __name__ == "__main__":
-    job_spec = json.loads(sys.argv[1])
+    arg = sys.argv[1]
+    job_spec = json.loads(arg if arg.lstrip().startswith("{") else Path(arg).read_text(encoding="utf-8"))
     print("RESULT " + json.dumps(JOBS[job_spec["job"]](job_spec)), flush=True)

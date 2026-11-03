@@ -280,7 +280,7 @@ class OptiDet(nn.Module):
             self._loss = OptiDetLoss(self)
         if tuple(pixels.shape[-2:]) != tuple(self.config.imgsz):
             raise ValueError(f"OptiDet built for {self.config.imgsz}, got images of {tuple(pixels.shape[-2:])}")
-        self._raw_outputs = True  # under the caller's autocast (bf16) if any
+        self._raw_outputs = True  # under the caller's autocast (bf16, fp16) if any
         try:
             feats, outputs = self(pixels)
         finally:
@@ -297,7 +297,7 @@ class OptiDet(nn.Module):
 
                 kd = pkd_loss([a(f.float()) for a, f in zip(distill, feats)], teacher_feats)
                 loss = loss + self.distill_weight * kd
-                parts["distill"] = float(kd)
+                parts["distill"] = kd.detach()
             return loss, parts
 
     @torch.no_grad()

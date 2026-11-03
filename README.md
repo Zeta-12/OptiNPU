@@ -44,7 +44,7 @@ from optinpu.tasks import Deployed, DetectionTask
 task = DetectionTask((640, 640), output="dets", resize="letterbox")   # how to feed / decode the model
 report = optimize("yolo26n.xml", task, guard_images, calibration=calib_images,
                   evaluation=CocoDetection("instances.json", "images/").to_subset(), ap_budget=0.005)
-print(report)                       # 25.9 ms -> 8.5 ms (3.0x), AP 44.8 = CPU FP32 (YOLO26-N)
+print(report)                       # 26.6 ms -> 9.30 ms (2.86x), AP as on the CPU in FP32 (YOLO26-N)
 report.save("yolo26n_npu/")         # report.md, report.json, the optimized deployment (part*.xml)
 model = Deployed(load_deployment("yolo26n_npu/"), task)
 model.predict("image.jpg")
@@ -79,13 +79,17 @@ comparison. Models that are wrong or crash on the NPU (e.g. YOLO26-S losing the 
 repaired first. Every compilation and inference runs in a watched child process (`optinpu.sandbox`): a
 compiler using 50 GB or a lost NPU cannot take your process down.
 
-Results on this machine (Core Ultra 5 235U, NPU 3720; AP on COCO val2017 [0, 500), decisions taken on
-other images):
+Results on this machine (Core Ultra 5 235U, NPU 3720, network on the NPU; AP on COCO val2017
+[0, 2500), decisions taken on other images):
 
 | Model | Before | After | Applied | AP CPU / before / after |
 |---|---|---|---|---|
-| YOLO26-N | 25.9 ms | **8.5 ms** | selection on the CPU | 44.8 / 40.7 / 44.8 |
-| YOLO26-S | 33.0 ms, loses the NPU | **13.7 ms** | selection on the CPU + mixed INT8 | 50.8 / - / 50.6 |
+| YOLO26-N | 26.6 ms | **9.30 ms** | selection on the CPU | 41.7 / 37.0 / 41.6 |
+| YOLO26-S | 33.1 ms, loses the NPU | **16.2 ms** | selection on the CPU | 49.4 / - / 49.4 |
+| RT-DETRv2-R18 | 47.4 ms | **40.6 ms** | INT8 (transformer scheme), repairs the 2-tile fault | 49.7 / 46.0 / 49.6 |
+| D-FINE-S | 46.3 ms | **42.9 ms** | mixed INT8 (7 of 19 groups in float) | 50.2 / 50.1 / 49.9 |
+
+The saved deployment can be rebuilt from its list of changes (`optinpu.optimizer.replay`).
 
 ## Training
 

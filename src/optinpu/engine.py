@@ -6,6 +6,8 @@ import contextlib
 import copy
 import json
 import math
+import random
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -30,10 +32,16 @@ class TrainConfig:
     warmup_steps: int = 100
     clip: float = 0.1
     ema_decay: float = 0.999
-    amp: bool = False  # bf16 autocast
+    # autocast: True or "bf16", or "fp16" with loss scaling (GPUs without native bf16, e.g. T4: bf16 is
+    # emulated there, 3.5x slower than FP32 on OptiDet-N)
+    amp: bool | str = False
     workers: int = 2
     device: str | None = None
     max_steps: int | None = None  # stop early (smoke tests)
+    # last.pt of an interrupted run (same epochs, batch and dataset): continue after its last epoch
+    resume: str | None = None
+    # stop after the last epoch that fits in this budget, e.g. under a session time limit (Kaggle: 12 h)
+    max_hours: float | None = None
     log_every: int = 20
     freeze_backbone: bool = False
     # Run the (frozen) backbone on another OpenVINO device, e.g. "npu": features of the next batch
@@ -63,11 +71,16 @@ class EMA:
     def update(self, model: nn.Module) -> None:
         self.updates += 1
         d = self.decay * (1 - math.exp(-self.updates / 2000))
+        floats, others = ([], []), ([], [])
         for ema_v, v in zip(self.module.state_dict().values(), model.state_dict().values()):
-            if ema_v.dtype.is_floating_point:
-                ema_v.mul_(d).add_(v.detach(), alpha=1 - d)
-            else:
-                ema_v.copy_(v)
+            pair = floats if ema_v.dtype.is_floating_point else others
+            pair[0].append(ema_v)
+            pair[1].append(v)
+        # one grouped call per list instead of kernel launches per tensor (hundreds per step)
+        if floats[0]:
+            torch._foreach_lerp_(*floats, 1 - d)
+        if others[0]:
+            torch._foreach_copy_(*others)
 
 
 class TorchPredictor:
@@ -98,6 +111,11 @@ def _compile_backbone(model: nn.Module, cfg: TrainConfig, imgsz, out_dir: Path):
     return compile_model(ir, cfg.backbone_device, hint="LATENCY")
 
 
+def _float_pixels(pixels: torch.Tensor) -> torch.Tensor:
+    """Model input in [0, 1] from CocoDetection's uint8 pixels (floats pass through)."""
+    return pixels.float().div_(255) if pixels.dtype == torch.uint8 else pixels
+
+
 def _batches(loader, external_backbone):
     """Yield (pixels, targets, features or None). With an external backbone, the features of the
     next batch are computed in a worker thread while the caller trains on the current one
@@ -109,12 +127,23 @@ def _batches(loader, external_backbone):
     with ThreadPoolExecutor(1) as pool:
         it = iter(loader)
         nxt = next(it, None)
-        future = pool.submit(external_backbone, nxt[0].numpy()) if nxt else None
+        future = pool.submit(external_backbone, _float_pixels(nxt[0]).numpy()) if nxt else None
         while nxt is not None:
             current, current_future = nxt, future
             nxt = next(it, None)
-            future = pool.submit(external_backbone, nxt[0].numpy()) if nxt else None
+            future = pool.submit(external_backbone, _float_pixels(nxt[0]).numpy()) if nxt else None
             yield current[0], current[1], current_future.result()
+
+
+def _amp_dtype(amp: bool | str) -> torch.dtype | None:
+    """Autocast dtype of TrainConfig.amp; None: FP32."""
+    if amp is False or amp is None:
+        return None
+    if amp is True or amp == "bf16":
+        return torch.bfloat16
+    if amp == "fp16":
+        return torch.float16
+    raise ValueError(f"amp must be False, True, 'bf16' or 'fp16', got {amp!r}")
 
 
 def _param_groups(model: nn.Module, cfg: TrainConfig) -> list[dict]:
@@ -145,12 +174,14 @@ def train(
     checkpoint_extra: dict | None = None,
 ) -> TrainResult:
     """Train `model` (must expose .loss(pixels, targets)); keep the best EMA weights by val mAP.
-    `checkpoint_extra` entries are saved in the checkpoint as is (e.g. the QAT quantizer config)."""
+    `checkpoint_extra` entries are saved in the checkpoint as is (e.g. the QAT quantizer config).
+    The whole training state goes to last.pt after every epoch, for TrainConfig.resume."""
     from optinpu.evaluate import evaluate_coco
 
     device = torch_device(cfg.device)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    amp_dtype = _amp_dtype(cfg.amp)
 
     external_backbone = None
     if cfg.freeze_backbone or cfg.backbone_device:
@@ -170,6 +201,8 @@ def train(
         total_steps = min(total_steps, cfg.max_steps)
     optimizer = torch.optim.AdamW(_param_groups(model, cfg), lr=cfg.lr, weight_decay=cfg.weight_decay)
     base_lrs = [g["lr"] for g in optimizer.param_groups]
+    # loss scaling keeps small fp16 gradients from flushing to zero; a pass-through otherwise
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
 
     def lr_factor(step: int) -> float:
         if step < cfg.warmup_steps:
@@ -181,29 +214,37 @@ def train(
 
     # -inf: without validation the score is -loss, which can be below any finite start value
     result = TrainResult(best_ap=float("-inf"), best_epoch=-1, checkpoint=out_dir / "best.pt")
-    step = 0
-    print(f"Training {name} on {device}: {len(train_set)} images, {len(loader)} steps/epoch, {cfg.epochs} epochs")
-    for epoch in range(cfg.epochs):
+    start_epoch, step = 0, 0
+    if cfg.resume:
+        start_epoch, step = _resume(Path(cfg.resume), cfg, len(loader), model, ema, optimizer, scaler, result)
+    print(f"Training {name} on {device}: {len(train_set)} images, {len(loader)} steps/epoch, {cfg.epochs} epochs"
+          + (f", {amp_dtype} autocast" if amp_dtype else "")
+          + (f", resuming at epoch {start_epoch}" if start_epoch else ""))
+    started = time.perf_counter()
+    for epoch in range(start_epoch, cfg.epochs):
         model.train()
         t0, losses = time.perf_counter(), []
         for pixels, targets, features in _batches(loader, external_backbone):
             for g, base in zip(optimizer.param_groups, base_lrs):
                 g["lr"] = base * lr_factor(step)
-            pixels = pixels.to(device, non_blocking=True)
+            pixels = _float_pixels(pixels.to(device, non_blocking=True))
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             backbone_ctx = contextlib.nullcontext()
             if features is not None:
                 backbone_ctx = model.external_backbone([torch.from_numpy(f).to(device) for f in features])
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.amp), backbone_ctx:
+            with torch.autocast(device.type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None), \
+                    backbone_ctx:
                 loss, parts = model.loss(pixels, targets)
             if not torch.isfinite(loss):
                 print(f"step {step}: non-finite loss, batch skipped")
                 optimizer.zero_grad(set_to_none=True)
                 continue
-            loss.backward()
+            scaler.scale(loss).backward()
             if cfg.clip:
+                scaler.unscale_(optimizer)  # clip the true gradients
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             ema.update(model)
             losses.append(loss.item())
@@ -231,6 +272,42 @@ def train(
             torch.save({"state_dict": ema.module.state_dict(), "class_names": train_set.class_names,
                         "epoch": epoch, "config": asdict(cfg), **(checkpoint_extra or {})}, result.checkpoint)
         (out_dir / "history.json").write_text(json.dumps(result.history, indent=2))
+        state = {"model": model.state_dict(), "ema": ema.module.state_dict(), "ema_updates": ema.updates,
+                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "step": step,
+                 "steps_per_epoch": len(loader), "best_ap": result.best_ap, "best_epoch": result.best_epoch,
+                 "history": result.history, "rng": (torch.get_rng_state(), random.getstate()), "config": asdict(cfg)}
+        torch.save(state, out_dir / "last.pt.tmp")  # a run killed while saving keeps the previous last.pt
+        (out_dir / "last.pt.tmp").replace(out_dir / "last.pt")
         if cfg.max_steps and step >= cfg.max_steps:
             break
+        if cfg.max_hours and epoch + 1 < cfg.epochs:
+            elapsed, done = time.perf_counter() - started, epoch + 1 - start_epoch
+            if elapsed * (done + 1) / done > cfg.max_hours * 3600:
+                print(f"stopping after epoch {epoch}: the next one would exceed max_hours={cfg.max_hours} "
+                      f"({elapsed / 3600:.2f} h so far); resume from {out_dir / 'last.pt'}")
+                break
     return result
+
+
+def _resume(path: Path, cfg: TrainConfig, steps_per_epoch: int, model, ema, optimizer, scaler,
+            result: TrainResult) -> tuple[int, int]:
+    """Restore the training state saved in last.pt; returns (first epoch to run, global step)."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    saved = (state["config"]["epochs"], state["steps_per_epoch"])
+    if saved != (cfg.epochs, steps_per_epoch):
+        raise ValueError(f"{path} was saved with {saved[0]} epochs of {saved[1]} steps, now {cfg.epochs} of "
+                         f"{steps_per_epoch}: the learning rate schedule would not match")
+    model.load_state_dict(state["model"])
+    ema.module.load_state_dict(state["ema"])
+    ema.updates = state["ema_updates"]
+    optimizer.load_state_dict(state["optimizer"])
+    if state["scaler"]:  # empty when saved without fp16
+        scaler.load_state_dict(state["scaler"])
+    # with workers=0, the same shuffling and augmentations as an uninterrupted run
+    torch.set_rng_state(state["rng"][0])
+    random.setstate(state["rng"][1])
+    result.best_ap, result.best_epoch, result.history = state["best_ap"], state["best_epoch"], state["history"]
+    best = path.with_name("best.pt")
+    if best.exists() and not result.checkpoint.exists():  # resumed into a new directory (next Kaggle session)
+        shutil.copy2(best, result.checkpoint)
+    return state["epoch"] + 1, state["step"]

@@ -7,12 +7,14 @@ For each predictor: Spearman rank correlation, mean absolute error (% of latency
 the regret of acting on its top pick: (best true saving - true saving of the predicted best) / best.
 "Measured (repeat)" compares run 2 with run 1: the best our own measurement can do at that noise.
 
-    python -m benchmarks.p1.summary
+    python -m benchmarks.p1.summary [results folder, default runs/p1/validate]
 """
 
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -37,8 +39,9 @@ def scores(truth: dict, predicted: dict, latency: float) -> dict:
 
 
 def main():
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else OUT
     rows = []
-    for path in sorted(OUT.glob("*.json")):
+    for path in sorted(out.glob("*.json")):
         if path.name == "summary.json":
             continue
         data = json.loads(path.read_text())
@@ -79,7 +82,7 @@ def main():
                   f"MAE {np.mean([r['mae_pct'] for r in sel]):.2f} % of latency  "
                   f"top-3 {np.mean([r['top3'] for r in sel]):.2f}  regret {np.mean([r['regret'] for r in sel]):.2f}  "
                   f"({len(sel)} models)")
-    (OUT / "summary.json").write_text(json.dumps(rows, indent=1))
+    (out / "summary.json").write_text(json.dumps(rows, indent=1))
 
 
 if __name__ == "__main__":

@@ -97,6 +97,59 @@ def load_deployment(directory: str | Path) -> list[tuple[Path, str, dict | None]
     return [(directory / p["ir"], p["device"], p["config"]) for p in spec["parts"]]
 
 
+def replay(model, changes: list[str], task, calibration: list, device: str = "npu",
+           config: dict | None = None) -> State:
+    """The state reached by applying recorded `changes` (State.changes, "applied" in report.json) to `model`
+    again, without measuring anything: e.g. to save a deployment that was not saved. INT8 must use the
+    calibration samples of the optimization (NNCF quantizes them in order: same samples, same graph).
+    "int8-mixed" is replayed with the CNN scheme: older reports also labelled transformer-scheme mixes so."""
+    if not isinstance(model, ov.Model):
+        model = core().read_model(model)
+    state = State(model, config)
+    for change in changes:
+        if change in ("int8", "int8-transformer"):
+            state = dataclasses.replace(state, model=int8_ptq(state.model, task, calibration, change == "int8-transformer"))
+        elif change.startswith(("int8-mixed (float: ", "int8-transformer-mixed (float: ")):
+            chosen = change[change.index("(float: ") + len("(float: "):-1].split(", ")
+            groups = _float_groups(state.model, chosen)
+            names = [n for g in chosen for n in groups[g]]
+            transformer = change.startswith("int8-transformer")
+            state = dataclasses.replace(state, model=int8_ptq(state.model, task, calibration, transformer, names))
+        elif change.startswith("tiles="):
+            state = dataclasses.replace(state, config={**(state.config or {}), "NPU_TILES": int(change[len("tiles="):])})
+        elif change == "decoder-on-1-tile":
+            state = dataclasses.replace(state, offload=device, offload_config={"NPU_TILES": 1})
+        elif change == "depthwise-to-dense":
+            state = dataclasses.replace(state, model=depthwise_to_dense(state.model)[0])
+        elif change.startswith("from-") and "-to-" in change:  # a heavy tail cut at a module boundary
+            region, target = change[len("from-"):].rsplit("-to-", 1)
+            roots, _, _ = selection_tail(state.model)
+            first = dict(_boundaries(state.model, roots[0]))[region]
+            state = dataclasses.replace(state, offload=target, offload_from=first)
+        elif change.split("-to-")[0] in ("selection", "decoder"):
+            state = dataclasses.replace(state, offload=change.split("-to-")[1])
+        else:
+            raise ValueError(f"cannot replay the change {change!r}")
+        state = dataclasses.replace(state, changes=[*state.changes, change])
+    return state
+
+
+def _float_groups(model: ov.Model, chosen: list[str]) -> dict[str, list[str]]:
+    """Module groups of a mixed-precision search, with the sub-groups it split (up to three times)."""
+    groups = quantizable_groups(model)
+    for _ in range(3):
+        missing = [g for g in chosen if g not in groups]
+        parents = {p for m in missing for p in groups if p != "(rest)" and m.startswith(p + ".")}
+        if not parents:
+            break
+        for p in parents:
+            groups.update(split_group(model, p, groups.pop(p)))
+    missing = [g for g in chosen if g not in groups]
+    if missing:
+        raise ValueError(f"unknown module groups {missing}")
+    return groups
+
+
 @dataclass
 class Trial:
     label: str
@@ -419,8 +472,9 @@ def optimize(
         for k in range(max(1, len(choose_float_groups(gains, floor - full_ap))), len(order) + 1):
             chosen = order[:k]
             names = [n for g in chosen for n in groups[g]]
+            scheme = "int8-transformer" if transformer else "int8"  # in the label, so that replay() can rebuild it
             mixed = dataclasses.replace(base, model=int8_ptq(base.model, task, calibration or samples, transformer, names),
-                                        changes=[*base.changes, f"int8-mixed (float: {', '.join(chosen)})"])
+                                        changes=[*base.changes, f"{scheme}-mixed (float: {', '.join(chosen)})"])
             t = measure({"current": base.parts(device), "mixed": mixed.parts(device)}, device, rounds=rounds,
                         iterations=iterations, adaptive=adaptive)
             saving, ci = paired_saving(t, "current", "mixed")

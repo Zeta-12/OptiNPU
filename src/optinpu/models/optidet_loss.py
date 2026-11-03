@@ -143,5 +143,5 @@ class OptiDetLoss:
                 loss_box = loss_dfl = cls_logits.sum() * 0
             for name, value in (("cls", loss_cls), ("box", loss_box), ("dfl", loss_dfl)):
                 total = total + self.weights[name] * value
-                parts[f"{head}_{name}"] = float(value)
+                parts[f"{head}_{name}"] = value.detach()  # not float(): no device sync per term and step
         return total, parts

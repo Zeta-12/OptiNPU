@@ -7,16 +7,17 @@ on train2017, where their AP is inflated; P3.1 still used train2017 [9670, 10000
   [2500, 3500), judged on 20 folds of 50 images against the CPU FP32 original (loss within the budget
   with 95 % confidence). P3.2 and the first P3.4 batch used [2500, 2700) and a point estimate; P3.4 and
   the first P3.5 runs used [2500, 3000) in 10 folds, which left a ~0.4-point margin.
-The final AP is measured on val2017 [0, N), on which nothing was decided.
+The final AP is measured on val2017 [0, N), on which nothing was decided: N = 2500 since P5 (500 before),
+and [3500, 4500) stays free, e.g. to confirm a mixed-precision choice on images it was not chosen on.
 Classifiers (ImageNet weights): slices of the fixed shuffle of ImageNetV2 (optinpu.data.imagenetv2_subset),
 none of which the models were trained on: guard [7300, 7600) (top-1 agreement), calibration
 [7000, 7300), top-1 budget [5000, 7000) in 10 folds of 200, report [0, 5000). Results go to
 runs/p3/optimize_<model>_<precision>.json (the network on the NPU, only the final selection on the CPU),
 or runs/p3/offload-<devices>/ with --offload (e.g. a DETR decoder on the iGPU, for comparison; batches
-1 to 3 of P3.4 allowed gpu,cpu); models already done are skipped (resumable, so the bench can be run a
-few models at a time).
+1 to 3 of P3.4 allowed gpu,cpu), the optimized deployment and its report to deploy/<model>_<precision>/
+next to it; models already done are skipped (resumable, so the bench can be run a few models at a time).
 
-    python -m benchmarks.p2.optimize_model yolo26-n:fp16 dfine-n:fp16 [--ap-budget 0.5] [--images 500]
+    python -m benchmarks.p2.optimize_model yolo26-n:fp16 dfine-n:fp16 [--ap-budget 0.5] [--images 2500]
 """
 
 from __future__ import annotations
@@ -66,15 +67,17 @@ def splits(task, args) -> tuple[list, list, object, int, object, str]:
             f"val2017 [0, {args.images})")
 
 
-def run(name: str, precision: str, args) -> dict:
+def run(name: str, precision: str, args, out) -> dict:
     entry = next(m for m in all_models() if m.name == name)
     model = ov.Core().read_model(entry.irs[precision])
     guard, calibration, evaluation, folds, report_set, report_name = splits(entry.task, args)
     report = optimize(model, entry.task, guard, "npu", None, calibration=calibration, evaluation=evaluation,
                       ap_budget=args.ap_budget / 100, folds=folds, int8=not args.no_int8, offload=offload(args))
     print(report, flush=True)
+    report.save(out / "deploy" / f"{name}_{precision}", f"{name} ({precision}) on the NPU")
     protocol = "ImageNetV2 slices" if isinstance(entry.task, ClassificationTask) else "val2017 selection"
     record = {"model": name, "precision": precision, "protocol": protocol, "metric": report.metric,
+              "report_set": report_name,
               "offload": offload(args), "report": str(report),
               "applied": report.final.label(),
               "baseline_ms": report.baseline_ms, "final_ms": report.final_ms,
@@ -103,7 +106,7 @@ def main():
     parser.add_argument("--ap-budget", type=float, default=0.5, help="AP points an approximate rewrite may cost")
     parser.add_argument("--eval-images", type=int, default=1000,
                         help="val2017 images [2500, ...) for the AP budget, in folds of 50 (0: no AP; classifiers: on/off)")
-    parser.add_argument("--images", type=int, default=500, help="val2017 images for the final AP")
+    parser.add_argument("--images", type=int, default=2500, help="val2017 images [0, N) for the final AP")
     parser.add_argument("--no-int8", action="store_true")
     parser.add_argument("--offload", default="", help="devices for a heavy tail, e.g. gpu,cpu (default: none)")
     parser.add_argument("--force", action="store_true", help="redo models already done")
@@ -120,7 +123,7 @@ def main():
         if on_ac_power() is False and not args.allow_battery:
             sys.exit(f"{spec}: on battery power, latencies would be throttled; plug the PC in (or --allow-battery)")
         print(f"===== {spec}", flush=True)
-        path.write_text(json.dumps(run(name, precision, args), indent=1, default=str))
+        path.write_text(json.dumps(run(name, precision, args, out), indent=1, default=str))
 
 
 if __name__ == "__main__":

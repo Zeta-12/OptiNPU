@@ -91,7 +91,7 @@ class Detector:
 
         data / val: CocoDetection, CocoSubset, or (annotations_json, image_dir).
         If the dataset classes differ from the model's, the class heads are re-created first.
-        Extra kwargs are TrainConfig fields (epochs, batch, lr, amp, device, ...).
+        Extra kwargs are TrainConfig fields (epochs, batch, lr, amp, device, resume, max_hours, ...).
         Exports made afterwards use the trained weights; artifacts go to workdir/<run>.
         """
         train_set, val_set = self._datasets(data, val)

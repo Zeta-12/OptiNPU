@@ -54,6 +54,14 @@ def _full_annotations(root: Path, split: str) -> Path:
     return path
 
 
+def _missing(image_dir: Path, images: list[dict]) -> list[str]:
+    """File names of `images` not yet in `image_dir`. One directory listing, not a stat per image: on a
+    network mount (Kaggle input) 117k stats took an hour."""
+    image_dir.mkdir(parents=True, exist_ok=True)
+    present = set(os.listdir(image_dir))
+    return [im["file_name"] for im in images if im["file_name"] not in present]
+
+
 def _full_val_annotations(root: Path) -> Path:
     return _full_annotations(root, "val")
 
@@ -88,8 +96,7 @@ def coco_train_subset(
         subset_json.parent.mkdir(parents=True, exist_ok=True)
         subset_json.write_text(json.dumps(data))
 
-    image_dir.mkdir(parents=True, exist_ok=True)
-    missing = [im["file_name"] for im in data["images"] if not (image_dir / im["file_name"]).exists()]
+    missing = _missing(image_dir, data["images"])
     if missing:
         print(f"Downloading {len(missing)} COCO train images to {image_dir}")
         with ThreadPoolExecutor(workers) as pool:
@@ -132,8 +139,7 @@ def coco_val_subset(
         subset_json.parent.mkdir(parents=True, exist_ok=True)
         subset_json.write_text(json.dumps(data))
 
-    image_dir.mkdir(parents=True, exist_ok=True)
-    missing = [im["file_name"] for im in data["images"] if not (image_dir / im["file_name"]).exists()]
+    missing = _missing(image_dir, data["images"])
     if missing:
         print(f"Downloading {len(missing)} COCO images to {image_dir}")
         with ThreadPoolExecutor(workers) as pool:
@@ -181,8 +187,7 @@ def coco_val_classes(
         out.write_text(json.dumps(data))
     data = json.loads(out.read_text())
 
-    image_dir.mkdir(parents=True, exist_ok=True)
-    missing_files = [im["file_name"] for im in data["images"] if not (image_dir / im["file_name"]).exists()]
+    missing_files = _missing(image_dir, data["images"])
     if missing_files:
         print(f"Downloading {len(missing_files)} COCO images to {image_dir}")
         with ThreadPoolExecutor(16) as pool:

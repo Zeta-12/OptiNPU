@@ -48,7 +48,10 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--batch", type=int, default=8)
     t.add_argument("--lr", type=float, default=2e-4)
     t.add_argument("--device")
-    t.add_argument("--amp", action="store_true", help="bf16 autocast")
+    t.add_argument("--amp", nargs="?", const="bf16", default=False, choices=("bf16", "fp16"),
+                   help="autocast, bf16 by default; fp16 (loss scaling) on GPUs without native bf16, e.g. T4")
+    t.add_argument("--resume", metavar="LAST_PT", help="continue an interrupted run from its last.pt")
+    t.add_argument("--max-hours", type=float, help="stop after the last epoch that fits in this time")
 
     q = sub.add_parser("qat", help="quantization-aware fine-tuning of a trained model, then INT8 export")
     q.add_argument("model")
@@ -157,6 +160,7 @@ def main(argv: list[str] | None = None) -> None:
         result = detector.train(
             tuple(args.train), tuple(args.val) if args.val else None, run=args.run,
             epochs=args.epochs, batch=args.batch, lr=args.lr, device=args.device, amp=args.amp,
+            resume=args.resume, max_hours=args.max_hours,
         )
         print(f"best epoch {result.best_epoch}, checkpoint {result.checkpoint}")
         print(f"NPU IR: {detector.export(precision='fp16')}")
