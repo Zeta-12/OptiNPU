@@ -27,9 +27,9 @@ RUNS = [
 IMAGE_DIRS = {"train2017", "val2017", "test2017"}
 
 
-def find(name: str, wait_s: int = 300) -> Path:
+def find(name: str, wait_s: int = 1200) -> Path:
     """First file `name` under /kaggle/input, without walking the COCO image folders. Inputs can be symlinks
-    and can be mounted late (one session did not see COCO 30 s after the start): retry for `wait_s`."""
+    and can be mounted late (two sessions saw coco2017/ still empty after 5 min): retry for `wait_s`."""
     deadline = time.time() + wait_s
     while True:
         for top, dirs, files in os.walk("/kaggle/input", followlinks=True):
@@ -39,7 +39,7 @@ def find(name: str, wait_s: int = 300) -> Path:
         if time.time() > deadline:
             break
         time.sleep(15)
-    sh("find", "/kaggle/input", "-maxdepth", "4", check=False)
+    sh("find", "/kaggle/input", "-maxdepth", "6", "-not", "-name", "*.jpg", check=False)
     raise FileNotFoundError(name)
 
 

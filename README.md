@@ -58,8 +58,8 @@ and reloads the saved deployment.
 **Profiler** (`profile_measured`, `optinpu profile --measured`). For each module region and each op type,
 the latency saved when it is bypassed, measured in paired, randomized rounds until the 95 % confidence
 interval is narrow. The NPU's own counters overlap (they sum to several times the real latency) and an
-additive per-op cost model ignores fusions: on 5 models, acting on their first pick loses 31 % and 32 %
-of the best possible saving, against at most 1 % for the measured profile.
+additive per-op cost model ignores fusions: on 5 models, acting on their first pick loses 31 % and 61 %
+of the best possible saving, against none for the measured profile.
 
 **Optimizer** (`optimize`, `optinpu optimize`). A greedy loop over measured candidates, each checked for
 accuracy against the CPU FP32 original: agreement on guard images (detection F1, same top-1 class, or

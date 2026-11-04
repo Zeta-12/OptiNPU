@@ -9,6 +9,8 @@
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
 \usetikzlibrary{positioning,arrows.meta}
 \usepackage{url}
 
@@ -27,7 +29,7 @@
 \maketitle
 
 \begin{abstract}
-Laptops now ship with neural processing units (NPUs) that promise low-power inference, yet modern object detectors run poorly on them. On an Intel Core Ultra NPU, none of seven state-of-the-art real-time detectors runs fastest on the NPU alone, FLOPs do not predict latency, the vendor's per-operation counters overlap, and the compiler can silently cost up to 4.6~AP or hang the device. We present \tool{}, an open-source tool that profiles, validates and optimizes a model for the NPU using on-device measurements only. It rests on an observation that we verify: latency does not depend on the values of dense weights, so any variant of a model, such as a bypassed region, a rewritten operation, or an architecture not yet retrained, can be timed exactly before it is trained or calibrated. \tool{} (i)~attributes latency by bypassing module regions in paired, randomized rounds, repeated until a 95\,\% confidence interval is narrow; (ii)~guards accuracy at the task level, with detection agreement and a paired non-inferiority test on COCO AP; and (iii)~greedily applies exact and approximate rewrites, including a latency-guided mixed-precision search, and reports retraining rewrites with their measured latency. On five models, measured profiling picks the best intervention (regret at most 0.01), while acting on vendor counters or on an additive cost model loses on average 31\,\% and 32\,\% of the best saving. The optimizer makes YOLO26-N 2.86$\times$ and YOLO26-S 2.04$\times$ faster on the NPU, repairing a silent 4.6-AP loss and a device hang, with AP within 0.1~points of CPU FP32. On DETR-family detectors, the gains are at most 1.17$\times$, and one repair costs latency. Mixed precision makes the ResNet-50 and MobileNetV2 classifiers 1.60$\times$ and 1.22$\times$ faster.
+Laptops now ship with neural processing units (NPUs) that promise low-power inference, yet modern object detectors run poorly on them. On an Intel Core Ultra NPU, none of seven state-of-the-art real-time detectors runs fastest on the NPU alone, FLOPs do not predict latency, the vendor's per-operation counters overlap, and the compiler can silently cost up to 4.6~AP or hang the device. We present \tool{}, an open-source tool that profiles, validates and optimizes a model for the NPU using on-device measurements only. It rests on an observation that we verify: latency does not depend on the values of dense weights, so any variant of a model, such as a bypassed region, a rewritten operation, or an architecture not yet retrained, can be timed exactly before it is trained or calibrated. \tool{} (i)~attributes latency by bypassing module regions in paired, randomized rounds, repeated until a 95\,\% confidence interval is narrow; (ii)~guards accuracy at the task level, with detection agreement and a paired non-inferiority test on COCO AP; and (iii)~greedily applies exact and approximate rewrites, including a latency-guided mixed-precision search, and reports retraining rewrites with their measured latency. On five models, measured profiling always picks the best intervention, while acting on vendor counters or on an additive cost model loses on average 31\,\% and 61\,\% of the best saving. The optimizer makes YOLO26-N 2.86$\times$ and YOLO26-S 2.04$\times$ faster on the NPU, repairing a silent 4.6-AP loss and a device hang, with AP within 0.1~points of CPU FP32. On DETR-family detectors, the gains are at most 1.17$\times$, and one repair costs latency. Mixed precision makes the ResNet-50 and MobileNetV2 classifiers 1.60$\times$ and 1.22$\times$ faster. On eight of the ten models, the NPU deployment uses 1.2 to 3.0$\times$ less energy per inference than the iGPU.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -93,16 +95,10 @@ RT-DETRv2-R18 & 48.1 & NPU+iGPU 34.9\ms & 80.7 (1 tile, 48.0) & 2.3$\times$ \\
 
 \textbf{O1: the NPU alone is never the fastest placement.} The NPU-only latency is 1.4 to 3.6$\times$ that of the best placement (Table~\ref{tab:m0}).
 
-\textbf{O2: FLOPs do not predict latency.} YOLO26-N (5.4~GFLOPs) takes 26 to 29\ms{}, while ResNet-50 at 224~px takes 4\ms{}. Micro-benchmarks of 396 blocks show where the time goes:
-\begin{itemize}
-\item depthwise convolutions reach only 0.1 to 0.3 TOPS;
-\item SiLU and HardSwish add 30 to 55\,\% to a layer;
-\item a LayerNorm over 6\,400 tokens costs almost as much as an MLP;
-\item a \texttt{TopK} inside the graph costs 1.2 to 2.5\ms{}, against 0.13\ms{} on the host CPU.
-\end{itemize}
+\textbf{O2: FLOPs do not predict latency.} YOLO26-N (5.4~GFLOPs) takes 26 to 29\ms{}, while ResNet-50 at 224~px takes 4\ms{}. Micro-benchmarks of 396 blocks show where the time goes: depthwise convolutions reach only 0.1 to 0.3 TOPS; SiLU and HardSwish add 30 to 55\,\% to a layer; a LayerNorm over 6\,400 tokens costs almost as much as an MLP; a \texttt{TopK} inside the graph costs 1.2 to 2.5\ms{}, against 0.13\ms{} on the host CPU.
 The latency of a detector depends on which operations it uses, not on how many FLOPs it has.
 
-\textbf{O3: vendor counters overlap.} The NPU reports per-task durations. For YOLO26-N (25.9\ms{}), the SHAVE tasks add up to 45.9\ms{} and the DPU tasks to 18.9\ms{}. On four models, the counters sum to 126 to 349\ms{} for inferences of 18 to 31\ms{}. The same model gave a sum of 66\ms{} in one run and 126\ms{} in the next.
+\textbf{O3: vendor counters overlap.} The NPU reports per-task durations. For YOLO26-N (25.9\ms{}), the SHAVE tasks add up to 45.9\ms{} and the DPU tasks to 18.9\ms{}. On four models, the counters sum to 123 to 297\ms{} for inferences of 17 to 31\ms{}. The same model gave a sum of 66\ms{} in one run and 126\ms{} in the next.
 
 \textbf{O4: costs are not additive.} Timing truncated prefixes of a graph gives some segments negative costs, down to $-3.7$\ms{}, because the compiler makes different decisions on each truncated graph.
 
@@ -115,7 +111,7 @@ O1--O6 rule out a static cost model: a tool for this NPU must measure latency an
 % =====================================================================================================
 \section{Related Work}
 
-\textbf{Latency prediction.} nn-Meter~\cite{zhang2021nnmeter} detects kernel fusions and sums kernel-level predictions; on an Intel VPU, only 83\,\% of its predictions fall within 10\,\% of the measured latency. HW-NAS-Bench~\cite{li2021hwnasbench} and BRP-NAS~\cite{dudziak2020brpnas} learn latency predictors for architecture search. O3 and O4 show that kernel costs do not add up on our NPU. We use an nn-Meter-style additive model as a baseline in Section~\ref{sec:eval-profiler}.
+\textbf{Latency prediction.} nn-Meter~\cite{zhang2021nnmeter} detects kernel fusions and sums kernel-level predictions; on an Intel VPU, only 83\,\% of its predictions fall within 10\,\% of the measured latency. HW-NAS-Bench~\cite{li2021hwnasbench} and BRP-NAS~\cite{dudziak2020brpnas} learn latency predictors for architecture search. O3 and O4 show that kernel costs do not add up on our NPU; Section~\ref{sec:eval-profiler} uses such an additive model as a baseline.
 
 \textbf{Hardware-aware design and compression.} NetAdapt~\cite{yang2018netadapt} adapts networks with empirical latency measurements; ProxylessNAS~\cite{cai2019proxylessnas} and MnasNet~\cite{tan2019mnasnet} put latency into the search objective; AMC~\cite{he2018amc} prunes under a resource budget. MobileDets~\cite{xiong2021mobiledets} and accelerator-aware NAS~\cite{gupta2020accelerator} show that edge accelerators favor regular, full convolutions over depthwise ones, which O2 confirms. These works produce new architectures and require training. \tool{} starts from a given model and first applies the changes that need no training.
 
@@ -181,12 +177,7 @@ D-FINE-N FP16 & $+0.1$\,\% & $\mathbf{+11.0}$\,\% & $-2.8$\,\% & $-2.8$\,\% \\
 \end{tabular}
 \end{table}
 
-This premise has three consequences:
-\begin{itemize}
-\item \tool{} can time any rewrite exactly before training it, for example SiLU replaced by ReLU in a model whose weights are not yet retrained;
-\item it profiles models on real images, which keeps data-dependent operations realistic;
-\item unstructured pruning becomes a rewrite whose speedup can be measured in advance.
-\end{itemize}
+This premise has three consequences: \tool{} can time any rewrite exactly before training it, for example SiLU replaced by ReLU in a model whose weights are not yet retrained; it profiles models on real images, which keeps data-dependent operations realistic; unstructured pruning becomes a rewrite whose speedup can be measured in advance.
 
 \subsection{Measured profiler}
 \label{sec:profiler}
@@ -231,7 +222,7 @@ YOLO26-N & $-4.6$ & 0.842 & 0.989 \\
 \end{equation}
 We use $B = 0.5$~AP. For a classifier, the same test applies to top-1 accuracy on a labeled set, with the same budget in accuracy points. This test decides whether the original deployment, a repair or an approximation counts as exact; agreement only decides when there are no annotations.
 
-\textbf{Test power.} The number of images matters in both directions. A point estimate on 200 images accepted a mixed-precision YOLO26-N within 0.3 points of the reference, which then lost 0.9 points on the report images; with the test, the same mix ($-0.37$ points, lower bound $-1.2$) is rejected. Conversely, 10 folds of 50 images left a margin of about 0.4 points: D-FINE-N's 0.25-point loss had a lower bound of $-0.64$, so the optimizer paid 15\ms{} to repair a loss within the budget. With 20 folds, the margins of approximate candidates close to the budget are 0.16 to 0.45 points on the seven detectors, and D-FINE-N's original deployment ($-0.18$, lower bound $-0.44$) is now exact. Top-1 on 2\,000 ImageNetV2 images is noisier, with margins of 0.37 to 0.92 points: a classifier mix passes only when it shows almost no loss.
+\textbf{Test power.} The number of images matters in both directions. A point estimate on 200 images accepted a mixed-precision YOLO26-N within 0.3 points of the reference, which then lost 0.9 points on the report images; with the test, the same mix ($-0.37$ points, lower bound $-1.2$) is rejected. Conversely, with 10 folds of 50 images, the optimizer paid 15\ms{} to repair D-FINE-N's 0.25-point loss (bound $-0.64$). With 20 folds, the margins of approximate candidates close to the budget are 0.16 to 0.45 points on the seven detectors, and D-FINE-N's original deployment ($-0.18$, lower bound $-0.44$) is now exact. Top-1 on 2\,000 ImageNetV2 images is noisier, with margins of 0.37 to 0.92 points: a classifier mix passes only when it shows almost no loss.
 
 \subsection{Optimizer}
 \label{sec:optimizer}
@@ -334,7 +325,7 @@ They are exported as FP16 IRs. To show that the approach is not specific to dete
 \subsection{Does measured profiling pick better interventions?}
 \label{sec:eval-profiler}
 
-\textbf{Ground truth.} On five models we apply 150 interventions: bypassing a region or an operation type, SiLU $\to$ ReLU, removing LayerNorms, and moving the final selection to the CPU. We measure each intervention's saving twice, in opposite orders. The ground truth is the mean of the two runs.
+\textbf{Ground truth.} On five models we apply 150 interventions: bypassing a region or an operation type, SiLU $\to$ ReLU, removing LayerNorms, and moving the final selection to the CPU. We measure each intervention's saving twice, in opposite orders, with up to 120 adaptive rounds. The ground truth is the mean of the two runs.
 
 \textbf{Predictors.} We compare three ways to predict these savings:
 \begin{itemize}
@@ -343,10 +334,10 @@ They are exported as FP16 IRs. To show that the approach is not specific to dete
 \item \emph{our measurement}: run~2 used to predict run~1, which is the reproducibility a single run of the tool achieves.
 \end{itemize}
 
-\textbf{Metrics.} Over the 73 significant interventions, we report Spearman's $\rho$, the mean absolute error as a percentage of the latency, the overlap of the top three interventions, and the \emph{regret}: the share of the best saving lost by applying the predictor's first choice.
+\textbf{Metrics.} Over the 97 significant interventions, we report Spearman's $\rho$, the mean absolute error as a percentage of the latency, the overlap of the top three interventions, and the \emph{regret}: the share of the best saving lost by applying the predictor's first choice.
 
 \begin{table}[t]
-\caption{Predicting the saving of an intervention: mean over five models (73 significant interventions out of 150).}
+\caption{Predicting the saving of an intervention: mean over five models (97 significant interventions out of 150).}
 \label{tab:profiler}
 \centering
 \footnotesize
@@ -354,16 +345,16 @@ They are exported as FP16 IRs. To show that the approach is not specific to dete
 \toprule
 Predictor & $\rho$ & Error (\% lat.) & Top-3 & Regret \\
 \midrule
-Vendor counters (scaled) & $+0.57$ & 3.7 & 0.53 & 0.31 \\
-Additive (isolated ops) & $+0.41$ & 11.6 & 0.80 & 0.32 \\
-\textbf{Measured (repeat)} & $\mathbf{+0.78}$ & \textbf{0.9} & \textbf{0.87} & \textbf{0.00} \\
+Vendor counters (scaled) & $+0.42$ & 2.9 & 0.67 & 0.31 \\
+Additive (isolated ops) & $+0.41$ & 9.4 & 0.60 & 0.61 \\
+\textbf{Measured (repeat)} & $\mathbf{+0.82}$ & \textbf{0.7} & \textbf{0.87} & \textbf{0.00} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:profiler} gives the results. Measurement never misses the best intervention: its regret is at most 0.01 on every model. The vendor counters have a regret of 0.62 on D-FINE-N and 0.82 on EfficientNet-B0. The additive model has a regret of 0.83 on ResNet-50, where its rank correlation is even negative ($-0.28$). Summed over all operations of the four larger models, the counters give 126 to 349\ms{} and the additive model 101 to 245\ms{}, for real latencies of 18 to 31\ms{}.
+Table~\ref{tab:profiler} gives the results. Measurement never misses the best intervention: its regret is 0 on every model. The vendor counters have a regret of 0.63 on D-FINE-N and 0.79 on EfficientNet-B0. The additive model has a regret of 0.99 on YOLO26-N and 0.79 on ResNet-50; on YOLO26-N, both baselines even rank the interventions in the wrong order ($\rho = -0.05$ and $-0.17$). Summed over all operations of the four larger models, the counters give 123 to 297\ms{} and the additive model 72 to 260\ms{}, for real latencies of 17 to 31\ms{}.
 
-\textbf{Limit.} On the smallest model (MobileNetV2, 7.2\ms{}), many savings are significant but close to each other, and their fine order stays at the noise level (measured $\rho = +0.62$). Adaptive rounds raised the number of significant interventions on this model from 3 to 11.
+\textbf{Limit.} On the smallest model (MobileNetV2, 7.0\ms{}), 21 of the 23 savings are significant but close to each other, and their fine order stays at the noise level even after 120 rounds: the repeated measurement ranks them less consistently ($\rho = +0.68$) than the vendor counters ($+0.75$), but still picks the best one (regret 0, against 0.11).
 
 \subsection{Optimizing detectors for the NPU}
 \label{sec:eval-optimizer}
@@ -390,7 +381,7 @@ RF-DETR-N & 83.4\ms{} & 81.7\ms{} (1.02$\times$) & INT8, transformer scheme & 50
 \end{tabular}
 \end{table*}
 
-\textbf{YOLO26.} The optimizer moves 16 operations, the final selection, to the CPU. This makes YOLO26-N 2.86$\times$ faster and YOLO26-S 2.04$\times$ faster on the NPU, and both now beat the iGPU (10.9 and 23.8\ms{}, Table~\ref{tab:m0}). The rewrite also removes both two-tile faults: the silent loss of 4.6~AP of YOLO26-N, and the device hang of YOLO26-S. The tail compiled alone on two tiles does not hang, so the faults arise when the compiler combines the selection with the rest of the graph. Mixed INT8 would then save up to 2.7\ms{} more on YOLO26-S, but every mix loses about 0.5~AP on the decision images, with lower bounds of $-0.73$ to $-0.89$. The test rejects them all, as it does on YOLO26-N, where INT8 would save at most 0.4\ms{}.
+\textbf{YOLO26.} The optimizer moves 16 operations, the final selection, to the CPU. This makes YOLO26-N 2.86$\times$ faster and YOLO26-S 2.04$\times$ faster on the NPU, and both now beat the iGPU (10.9 and 23.8\ms{}, Table~\ref{tab:m0}). The rewrite also removes both two-tile faults: the silent loss of 4.6~AP of YOLO26-N, and the device hang of YOLO26-S. The tail compiled alone on two tiles does not hang, so the faults arise when the compiler combines the selection with the rest of the graph. Mixed INT8 would then save up to 2.7\ms{} more on YOLO26-S, but every mix loses about 0.5~AP (lower bounds $-0.73$ to $-0.89$) and is rejected, as on YOLO26-N.
 
 \textbf{DETR family.} Without leaving the NPU, the DETRs mostly need repairs, and the guard decides what they may cost:
 \begin{itemize}
@@ -452,6 +443,18 @@ RF-DETR-N & 40.1\ms{}$^\dagger$ & 50.0 / 49.7 & iGPU 23.0\ms{} \\
 \end{tabular}
 \end{table}
 
+\subsection{Energy per inference}
+\label{sec:energy}
+
+Windows exposes the RAPL energy counters of the whole package (CPU cores, iGPU, NPU and the rest of the SoC); the NPU has no counter of its own. We measure the package power during three 8\,s windows of back-to-back inferences (Fig.~\ref{fig:power}): 10 to 15\,W on the NPU, 19 to 23\,W on the iGPU and 24 to 26\,W on the CPU. Multiplied by the latency, it gives the energy of one inference. On eight of the ten models, the NPU deployment uses 1.2 to 3.0$\times$ less energy than the iGPU, and the CPU 2.4 to 28$\times$ more. The exceptions are the repaired DEIMv2-N (one tile) and RF-DETR-N, where the iGPU is both faster and more frugal; there, as on D-FINE-N, the NPU+iGPU deployment uses the least energy.
+
+\begin{figure}[t]
+\centering
+\input{fig_power}
+\caption{Package power while inferring back to back: \tool{}'s NPU deployment (Tables~\ref{tab:results} and~\ref{tab:classifiers}), its NPU+iGPU deployment (Table~\ref{tab:offload}), and the original on the iGPU and the CPU (FP32). At idle, the package draws 7 to 10\,W.}
+\label{fig:power}
+\end{figure}
+
 \subsection{Case studies}
 \label{sec:case}
 
@@ -467,55 +470,23 @@ The profiler attributes 72\,\% of the latency (18.6\ms{}) to the head. The vendo
 \textbf{Module groups miss operations.} On D-FINE-N, keeping 18 of 20 module groups in float still left a 3.1-point loss. With every group in float, 64 quantizers remained, almost all on the decoder's box and reference-point arithmetic, which belongs to no module containing a convolution. The \emph{rest} group fixes this, and it becomes the most useful group of D-FINE-N: keeping it in float recovers 2.85~AP and even saves 0.47\ms{}.
 
 \subsubsection{Repairing on the NPU}
-On RT-DETRv2, the two-tile fault sits in the decoder's self-attention. Rewriting the attention in the IR changes nothing, because the compiler normalizes all its variants. Compiling the decoder apart on one tile, with the rest on two, repairs the model on the NPU (Table~\ref{tab:split}). The repair is expensive, however: cutting the graph into two NPU inferences alone costs 8.9\ms{}, and one tile slows the decoder down by 19\ms{}. INT8 with the transformer scheme also removes the fault (AP $-0.29$ instead of $-2.9$), because the compiler then partitions the attention differently. The optimizer measures these repairs and picks the fastest one: here INT8 (40.6\ms{}), faster than the original. Two rules made this possible. First, approximate candidates may repair an inexact state. Second, mixed precision may be searched on an inexact state when full INT8 already keeps the mean loss within the budget and only misses its lower bound. Without these rules, the optimizer took the one-tile decoder and ended at 71.0\ms{}.
+On RT-DETRv2, the two-tile fault sits in the decoder's self-attention. Rewriting the attention in the IR changes nothing, because the compiler normalizes all its variants. Compiling the decoder apart on one tile, with the rest on two, repairs the model on the NPU (agreement 0.721 $\to$ 0.995), but costs 75.4\ms{} instead of 47.1: cutting the graph into two NPU inferences alone costs 8.9\ms{}, and one tile slows the decoder down by 19\ms{}. INT8 with the transformer scheme also removes the fault (AP $-0.29$ instead of $-2.9$), because the compiler then partitions the attention differently. The optimizer measures these repairs and picks the fastest one: here INT8 (40.6\ms{}), faster than the original. Two rules made this possible. First, approximate candidates may repair an inexact state. Second, mixed precision may be searched on an inexact state when full INT8 already keeps the mean loss within the budget and only misses its lower bound. Without these rules, the optimizer took the one-tile decoder and ended at 71.0\ms{}.
 
-\begin{table}[t]
-\caption{Repairing RT-DETRv2 (FP16) without leaving the NPU (30 guard images).}
-\label{tab:split}
-\centering
-\footnotesize
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Deployment on the NPU & Latency & Agreement \\
-\midrule
-Whole graph, 2 tiles (default) & 47.1\ms{} & 0.721 \\
-Cut at the query selection, both parts on 2 tiles & 56.0\ms{} & 0.721 \\
-Encoder on 1 tile, decoder on 2 & 72.3\ms{} & 0.721 \\
-\textbf{Encoder on 2 tiles, decoder on 1} & 75.4\ms{} & \textbf{0.995} \\
-Whole graph, 1 tile & 80.6\ms{} & 0.995 \\
-\bottomrule
-\end{tabular}
-\end{table}
 
 \subsection{Retraining rewrites, measured before training}
 
-Thanks to the premise, \tool{} reports the exact latency of rewrites that need retraining:
-\begin{itemize}
-\item SiLU $\to$ ReLU would make the optimized YOLO26-N 21\,\% faster (7.33\ms{}), YOLO26-S 17\,\% faster (13.4\ms{}) and EfficientNet-B0 35\,\% faster (1.79\ms{});
-\item pruning 50\,\% or 75\,\% of the weights would make the optimized ResNet-50 23\,\% or 32\,\% faster (1.86 or 1.63\ms{});
-\item on the five DETR-family models, the best of these rewrites brings only 3 to 8\,\%.
-\end{itemize}
+Thanks to the premise, \tool{} reports the exact latency of rewrites that need retraining: SiLU $\to$ ReLU would make the optimized YOLO26-N 21\,\% faster (7.33\ms{}), YOLO26-S 17\,\% faster (13.4\ms{}) and EfficientNet-B0 35\,\% faster (1.79\ms{}); pruning 50\,\% or 75\,\% of the weights would make the optimized ResNet-50 23\,\% or 32\,\% faster (1.86 or 1.63\ms{}); on the five DETR-family models, the best of these rewrites brings only 3 to 8\,\%.
 \tool{} does not retrain the model: it tells, before any training, which retraining is worth its cost. A gain of 17 to 35\,\% justifies fine-tuning YOLO26 or EfficientNet-B0 with ReLU; 3 to 8\,\% hardly justifies retraining a DETR.
 
 % =====================================================================================================
 \section{Discussion and Limitations}
 \label{sec:limits}
 
-\textbf{One NPU.} We measured a single NPU (3720), with a single driver and compiler version. Its faults and costs may change with a driver update; this is precisely why \tool{} measures instead of encoding rules. Porting it to another NPU supported by OpenVINO only requires a device name; another runtime would need new sandboxed jobs. \todo{second NPU or newer driver if available.}
+\textbf{One NPU.} We measured a single NPU (3720), with a single driver and compiler version, and did not test \tool{} on another NPU. Its faults and costs may differ on other NPUs or change with a driver update; this is precisely why \tool{} measures instead of encoding rules. Porting it to another NPU supported by OpenVINO only requires a device name; another runtime would need new sandboxed jobs.
 
-\textbf{What we do not measure.} We do not report energy, although low power is the reason to use the NPU. \todo{energy measurement, if feasible on this platform.}
+\textbf{Accuracy guard.} The guard relies on samples. Agreement on 30 images can miss AP losses (Section~\ref{sec:guard}), so AP decides when annotations exist; without them, an approximate rewrite must reach the agreement of an exact one, a conservative rule. Keeping the first of several mixes that passes favors an underestimated loss (Section~\ref{sec:eval-classifiers}); a confirmation on held-out images would remove this bias.
 
-\textbf{Accuracy guard.} The guard relies on samples:
-\begin{itemize}
-\item agreement on 30 images can miss AP losses (Section~\ref{sec:guard}), so AP decides when annotations exist;
-\item without annotations, an approximate rewrite must reach the agreement of an exact one, a conservative rule;
-\item keeping the first of several mixes that passes favors an underestimated loss (Section~\ref{sec:eval-classifiers}); a confirmation on held-out images would remove this bias;
-\item the non-inferiority test uses 1\,000 val2017 images and the report 2\,500 others; the remaining images serve for calibration and the guard, or are held out.
-\end{itemize}
-
-\textbf{Cost of the search.} The search applies one change at a time, so it can miss combinations that only pay off together. A whole run, final evaluation included, takes 12 to 24 minutes for a classifier and from 35 minutes (RT-DETRv2) to 1~h~45 (D-FINE-N) for a detector on our laptop.
-
-\textbf{Scope.} Beyond detectors and classifiers, other models can use the generic output-agreement task, without a metric test.
+\textbf{Cost of the search.} The search applies one change at a time, so it can miss combinations that only pay off together. A whole run, final evaluation included, takes 12 to 24 minutes for a classifier and from 35 minutes (RT-DETRv2) to 1~h~45 (D-FINE-N) for a detector on our laptop. Beyond detectors and classifiers, other models can use the generic output-agreement task, without a metric test.
 
 % =====================================================================================================
 \section{Conclusion}
@@ -523,7 +494,7 @@ Thanks to the premise, \tool{} reports the exact latency of rewrites that need r
 On a client NPU, latency cannot be predicted from FLOPs, vendor counters or per-operation costs, and the compiler can be silently wrong. Two facts make a measurement-only approach practical: latency does not depend on dense weight values, and paired, randomized, adaptive rounds measure small savings reliably. \tool{} turns these facts into a profiler that picks the right intervention, an accuracy guard grounded in the task, and an optimizer that repairs and accelerates detectors without leaving the NPU. It repairs the four detectors that the compiler gets wrong and makes YOLO26-N and -S 2.86 and 2.04$\times$ faster, ahead of the iGPU; DETR-family models gain at most 1.17$\times$ on the NPU alone. Mixed precision makes ResNet-50 1.60$\times$ and MobileNetV2 1.22$\times$ faster, and the measured what-ifs tell which retraining is worth its cost.
 
 \section*{Acknowledgment}
-\todo{acknowledgments, if any.}
+The author used AI tools to help gather the references and write this paper, and reviewed all of its content.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
