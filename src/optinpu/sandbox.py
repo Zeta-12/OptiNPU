@@ -13,6 +13,7 @@ prints one line "RESULT <json>".
 
 from __future__ import annotations
 
+import itertools
 import json
 import subprocess
 import sys
@@ -166,6 +167,17 @@ def _outputs(spec: dict) -> dict:
     return {"samples": len(samples)}
 
 
+def _timing_samples(compiled: ov.CompiledModel, mode: str = "random") -> list[list[np.ndarray]]:
+    """Input samples for timing, used in turn: one fixed sample (_random_inputs), or with "file:<npz>" the
+    samples saved there by optinpu.profiler.measure (e.g. real preprocessed images), as s<i>_<j> arrays."""
+    if not mode.startswith("file:"):
+        return [_random_inputs(compiled, mode)]
+    with np.load(mode[len("file:"):]) as data:
+        count = len({k.split("_")[0] for k in data.files})
+        return [[data[k] for k in sorted((k for k in data.files if k.startswith(f"s{i}_")),
+                                         key=lambda k: int(k.split("_")[1]))] for i in range(count)]
+
+
 def _random_inputs(compiled: ov.CompiledModel, mode: str = "random") -> list[np.ndarray]:
     """Inputs for timing: uniform [0, 1) ("random") or "zeros" (to test data-dependent timing)."""
     rng = np.random.default_rng(0)
@@ -189,10 +201,11 @@ def _chain(parts: list, mode: str):
     for path, device, config in parts:
         compiled = compile_model(path, device, config=config, cache_dir=None).compiled
         chain.append((compiled, compiled.create_infer_request()))
-    inputs = _random_inputs(chain[0][0], mode)
+    samples = _timing_samples(chain[0][0], mode)
+    turn = itertools.count()
 
     def run():
-        data = inputs
+        data = samples[next(turn) % len(samples)]
         for compiled, request in chain:
             result = request.infer(data, share_inputs=True, share_outputs=True)
             data = [result[o] for o in compiled.outputs]

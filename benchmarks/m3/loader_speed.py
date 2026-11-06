@@ -23,12 +23,16 @@ def main():
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--batches", type=int, default=100)
+    parser.add_argument("--mosaic", type=float, default=0.0, help="mosaic probability")
+    parser.add_argument("--no-jitter", action="store_true", help="color jitter left to the GPU (--color-jitter)")
     args = parser.parse_args()
 
     from optinpu.models import get_model
 
     subset = coco_train_subset(args.images)
-    train = CocoDetection(subset.annotations, subset.image_dir, get_model(args.model).imgsz, augment=True, zoom=True)
+    train = CocoDetection(subset.annotations, subset.image_dir, get_model(args.model).imgsz, augment=True, zoom=True,
+                         mosaic=args.mosaic)
+    train.jitter = not args.no_jitter
     loader = torch.utils.data.DataLoader(train, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                                          collate_fn=collate, drop_last=True)
     batches = iter(loader)
@@ -38,7 +42,8 @@ def main():
     for _ in range(args.batches):
         next(batches)
     rate = args.batches * args.batch / (time.perf_counter() - t)
-    print(f"loader alone, {args.workers} workers, batch {args.batch}: {rate:.1f} img/s", flush=True)
+    print(f"loader alone, {args.workers} workers, batch {args.batch}, mosaic {args.mosaic}, jitter {train.jitter}: {rate:.1f} img/s",
+          flush=True)
 
 
 if __name__ == "__main__":  # required on Windows: DataLoader workers re-import this file

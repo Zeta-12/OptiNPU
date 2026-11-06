@@ -2,6 +2,7 @@
 
     python -m benchmarks.m2.train_optidet --images 10000 --epochs 24 --batch 16
     python -m benchmarks.m2.train_optidet --smoke          # 30 steps: speed check
+    torchrun --nproc_per_node 2 benchmarks/m2/train_optidet.py ...   # one process per GPU (--batch is global)
 
 The backbone starts from ImageNet RepVGG-A0 (MIT weights via timm); neck and heads are random.
 """
@@ -9,6 +10,7 @@ The backbone starts from ImageNet RepVGG-A0 (MIT weights via timm); neck and hea
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 from optinpu import Detector
@@ -34,16 +36,23 @@ def main():
     parser.add_argument("--distill", metavar="REPO", help="PKD feature distillation from this D-FINE checkpoint, "
                                                           "e.g. ustc-community/dfine-small-coco")
     parser.add_argument("--distill-weight", type=float, default=2.0)
+    parser.add_argument("--mosaic", type=float, default=0.0, help="probability of a 4-image mosaic sample")
+    parser.add_argument("--close-mosaic", type=int, default=0, help="last epochs without mosaic")
+    parser.add_argument("--color-jitter", type=float, default=0.0,
+                        help="> 0: color jitter of this strength on the GPU instead of the data workers (0.3)")
     parser.add_argument("--smoke", nargs="?", type=int, const=30, metavar="STEPS",
                         help="STEPS steps (default 30) without validation: speed check")
     args = parser.parse_args()
 
     from optinpu.models import get_model
 
+    # under torchrun, the process of rank 0 alone prints
+    say = print if os.environ.get("RANK", "0") == "0" else (lambda *a, **k: None)
     imgsz = get_model(args.model).imgsz
     train_subset = coco_train_subset(args.images)
     val_subset = coco_val_subset(500)
-    train = CocoDetection(train_subset.annotations, train_subset.image_dir, imgsz, augment=True, zoom=True)
+    train = CocoDetection(train_subset.annotations, train_subset.image_dir, imgsz, augment=True, zoom=True,
+                          mosaic=args.mosaic)
     val = CocoDetection(val_subset.annotations, val_subset.image_dir, imgsz)
     # built with the dataset's classes, so that train() does not rebuild the heads (and drop the adapters)
     model = Detector(args.model, pretrained=True, class_names=train.class_names)
@@ -51,18 +60,19 @@ def main():
         from optinpu.models.distill import DFineTeacher
 
         model.model.enable_distillation(DFineTeacher(args.distill), weight=args.distill_weight)
-        print(f"distillation from {args.distill} (PKD, weight {args.distill_weight})", flush=True)
-    print(f"{args.model} at {imgsz}: {len(train)} training images, {len(val)} validation images", flush=True)
+        say(f"distillation from {args.distill} (PKD, weight {args.distill_weight})", flush=True)
+    say(f"{args.model} at {imgsz}: {len(train)} training images, {len(val)} validation images", flush=True)
 
     config = dict(
         epochs=1 if args.smoke else args.epochs, batch=args.batch, lr=args.lr, backbone_lr=args.backbone_lr,
         weight_decay=args.weight_decay, warmup_steps=args.warmup, clip=10.0, ema_decay=0.9998,
         amp=args.amp, workers=args.workers, log_every=10 if args.smoke else 50,
-        max_steps=args.smoke, resume=args.resume, max_hours=args.max_hours,
+        max_steps=args.smoke, resume=args.resume, max_hours=args.max_hours, close_mosaic=args.close_mosaic,
+        color_jitter=args.color_jitter,
     )
     t = time.time()
     result = model.train(train, None if args.smoke else val, run=args.run + ("_smoke" if args.smoke else ""), **config)
-    print(f"done in {(time.time() - t) / 60:.1f} min; best AP {result.best_ap:.3f} at epoch {result.best_epoch}", flush=True)
+    say(f"done in {(time.time() - t) / 60:.1f} min; best AP {result.best_ap:.3f} at epoch {result.best_epoch}", flush=True)
 
 
 if __name__ == "__main__":  # required on Windows: DataLoader workers re-import this file

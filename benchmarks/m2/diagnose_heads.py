@@ -34,9 +34,9 @@ class Many:
         cls, reg = model.flatten(model.one2many(model.features(x)))
         scores = cls.sigmoid()[0]
         boxes = (model.boxes(model.distances(reg)) / model.scale)[0]
-        best, labels = scores.max(-1)
-        keep = best > 0.001
-        best, labels, boxes = best[keep], labels[keep], boxes[keep]
+        # multi-label (box, class) pairs as in the standard COCO protocol and the one-to-one evaluation
+        anchor, labels = (scores > 0.001).nonzero(as_tuple=True)
+        best, boxes = scores[anchor, labels], boxes[anchor]
         idx = batched_nms(boxes, best, labels, 0.65)[:300]
         w, h = image.size
         scale = torch.tensor([w, h, w, h])
@@ -48,10 +48,11 @@ def main():
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 100
     detector = Detector.from_checkpoint("optidet-n", checkpoint)
     subset = coco_val_subset(n)
-    one = evaluate_coco(detector, subset, device="torch")
-    many = evaluate_coco(Many(detector), subset, device="torch")
-    print(f"one-to-one (inference head): AP {one.AP:.3f} AP50 {one.AP50:.3f}")
-    print(f"one-to-many + NMS:           AP {many.AP:.3f} AP50 {many.AP50:.3f}")
+    one = evaluate_coco(detector, subset, device="torch", folds=5)
+    many = evaluate_coco(Many(detector), subset, device="torch", folds=5)
+    for label, r in (("one-to-one (inference head)", one), ("one-to-many + NMS", many)):
+        print(f"{label:<28} AP {r.AP:.3f} AP50 {r.AP50:.3f} AP75 {r.AP75:.3f} APs {r.APs:.3f} APm {r.APm:.3f} "
+              f"APl {r.APl:.3f} folds {[round(a, 3) for a in r.fold_ap]}")
 
 
 if __name__ == "__main__":

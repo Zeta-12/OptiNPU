@@ -412,7 +412,14 @@ def m2() -> list[Block]:
     return candidates()
 
 
-SUITES = {"S1": s1, "S2": s2, "S3": s3, "S4": s4, "S5": s5, "S6": s6, "S7": s7, "M2": m2}
+def m3() -> list[Block]:
+    """OptiDet-N variants at higher resolution (benchmarks/m3/candidates.py)."""
+    from benchmarks.m3.candidates import candidates
+
+    return candidates()
+
+
+SUITES = {"S1": s1, "S2": s2, "S3": s3, "S4": s4, "S5": s5, "S6": s6, "S7": s7, "M2": m2, "M3": m3}
 
 
 def all_blocks(suites=None) -> list[Block]:

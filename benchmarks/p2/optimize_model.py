@@ -16,8 +16,12 @@ runs/p3/optimize_<model>_<precision>.json (the network on the NPU, only the fina
 or runs/p3/offload-<devices>/ with --offload (e.g. a DETR decoder on the iGPU, for comparison; batches
 1 to 3 of P3.4 allowed gpu,cpu), the optimized deployment and its report to deploy/<model>_<precision>/
 next to it; models already done are skipped (resumable, so the bench can be run a few models at a time).
+P6 (review): --device gpu runs the same optimizer for the iGPU (a fair reference for the NPU: same rewrites,
+INT8 and mixed precision); --confirm re-tests every accepted approximation once on held-out images
+(val2017 [3500, 4500) in 20 folds; ImageNetV2 [7600, 9600) in 10 folds); --out sets the results folder.
 
     python -m benchmarks.p2.optimize_model yolo26-n:fp16 dfine-n:fp16 [--ap-budget 0.5] [--images 2500]
+    python -m benchmarks.p2.optimize_model yolo26-n:fp16 --device gpu --out runs/p6/igpu
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import argparse
 import ctypes
 import json
 import sys
+from pathlib import Path
 
 import openvino as ov
 
@@ -67,17 +72,27 @@ def splits(task, args) -> tuple[list, list, object, int, object, str]:
             f"val2017 [0, {args.images})")
 
 
+def confirmation_set(task) -> tuple[object, int]:
+    """Held-out images for the confirmation of approximations (--confirm), disjoint from every other split."""
+    if isinstance(task, ClassificationTask):
+        return imagenetv2_subset(2000, 7600), 10
+    return coco_val_subset(1000, offset=3500), 20
+
+
 def run(name: str, precision: str, args, out) -> dict:
     entry = next(m for m in all_models() if m.name == name)
     model = ov.Core().read_model(entry.irs[precision])
     guard, calibration, evaluation, folds, report_set, report_name = splits(entry.task, args)
-    report = optimize(model, entry.task, guard, "npu", None, calibration=calibration, evaluation=evaluation,
-                      ap_budget=args.ap_budget / 100, folds=folds, int8=not args.no_int8, offload=offload(args))
+    confirmation, confirmation_folds = confirmation_set(entry.task) if args.confirm else (None, None)
+    device = args.device
+    report = optimize(model, entry.task, guard, device, None, calibration=calibration, evaluation=evaluation,
+                      ap_budget=args.ap_budget / 100, folds=folds, int8=not args.no_int8, offload=offload(args),
+                      confirmation=confirmation, confirmation_folds=confirmation_folds)
     print(report, flush=True)
-    report.save(out / "deploy" / f"{name}_{precision}", f"{name} ({precision}) on the NPU")
+    report.save(out / "deploy" / f"{name}_{precision}", f"{name} ({precision}) on the {device.upper()}")
     protocol = "ImageNetV2 slices" if isinstance(entry.task, ClassificationTask) else "val2017 selection"
-    record = {"model": name, "precision": precision, "protocol": protocol, "metric": report.metric,
-              "report_set": report_name,
+    record = {"model": name, "precision": precision, "device": device, "confirm": args.confirm,
+              "protocol": protocol, "metric": report.metric, "report_set": report_name,
               "offload": offload(args), "report": str(report),
               "applied": report.final.label(),
               "baseline_ms": report.baseline_ms, "final_ms": report.final_ms,
@@ -86,8 +101,8 @@ def run(name: str, precision: str, args, out) -> dict:
               "trials": [vars(t) for t in report.trials], "recommendations": [vars(t) for t in report.recommendations]}
     if report_set is not None:
         val = {}
-        for label, parts in (("cpu", [(model, "cpu", None)]), ("baseline", [(model, "npu", None)]),
-                             ("final", report.final.parts("npu"))):
+        for label, parts in (("cpu", [(model, "cpu", None)]), ("baseline", [(model, device, None)]),
+                             ("final", report.final.parts(device))):
             result, job = run_evaluation(parts, entry.task, report_set)
             val[label] = result["score"] if result else f"failed: {(job.error or '')[-100:]}"
         record["val_ap"] = val
@@ -111,8 +126,11 @@ def main():
     parser.add_argument("--offload", default="", help="devices for a heavy tail, e.g. gpu,cpu (default: none)")
     parser.add_argument("--force", action="store_true", help="redo models already done")
     parser.add_argument("--allow-battery", action="store_true", help="measure even on battery power")
+    parser.add_argument("--device", default="npu", choices=("npu", "gpu"), help="device to optimize for")
+    parser.add_argument("--confirm", action="store_true", help="confirm accepted approximations on held-out images")
+    parser.add_argument("--out", type=Path, help="results folder (default: runs/p3, or runs/p3/offload-<devices>)")
     args = parser.parse_args()
-    out = OUT / f"offload-{'-'.join(offload(args))}" if offload(args) else OUT
+    out = args.out or (OUT / f"offload-{'-'.join(offload(args))}" if offload(args) else OUT)
     out.mkdir(parents=True, exist_ok=True)
     for spec in args.models:
         name, precision = spec.split(":")

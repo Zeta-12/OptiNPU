@@ -54,6 +54,15 @@ def _full_annotations(root: Path, split: str) -> Path:
     return path
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a per-process temporary file: processes building the same subset (one per GPU under
+    torchrun) never read a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
 def _missing(image_dir: Path, images: list[dict]) -> list[str]:
     """File names of `images` not yet in `image_dir`. One directory listing, not a stat per image: on a
     network mount (Kaggle input) 117k stats took an hour."""
@@ -94,7 +103,7 @@ def coco_train_subset(
             "categories": full["categories"],
         }
         subset_json.parent.mkdir(parents=True, exist_ok=True)
-        subset_json.write_text(json.dumps(data))
+        _write_atomic(subset_json, json.dumps(data))
 
     missing = _missing(image_dir, data["images"])
     if missing:
@@ -137,7 +146,7 @@ def coco_val_subset(
             "categories": full["categories"],
         }
         subset_json.parent.mkdir(parents=True, exist_ok=True)
-        subset_json.write_text(json.dumps(data))
+        _write_atomic(subset_json, json.dumps(data))
 
     missing = _missing(image_dir, data["images"])
     if missing:
@@ -184,7 +193,7 @@ def coco_val_classes(
             "categories": cats,
         }
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(data))
+        _write_atomic(out, json.dumps(data))
     data = json.loads(out.read_text())
 
     missing_files = _missing(image_dir, data["images"])

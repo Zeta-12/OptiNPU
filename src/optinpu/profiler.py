@@ -378,7 +378,8 @@ def measure(variants: dict, device: str = "npu", config: dict | None = None,
 
     A variant is an ov.Model or IR path (run on `device` with `config`), or a list of
     (model, device, config) parts run back to back (e.g. NPU head, CPU tail).
-    input_modes: variant name -> "random" (default) or "zeros".
+    input_modes: variant name -> "random" (default), "zeros", or "file:<npz>" (samples s<i>_<j> used in turn,
+    e.g. real preprocessed images).
     When the whole job fails (one variant losing the NPU kills the process), each variant is measured
     again in its own process (with the reference, if any), so that only the culprit is reported as failed."""
     timings = _measure_once(variants, device, config, rounds, iterations, timeout, max_gb, input_modes, adaptive)

@@ -1,0 +1,14 @@
+{
+  "id": "julienbeloin/coco-train-512",
+  "title": "coco-train-512",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["awsaf49/coco-2017-dataset"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

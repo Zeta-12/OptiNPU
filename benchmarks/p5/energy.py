@@ -15,9 +15,15 @@ energy of one inference is that power times the mean latency, in total and above
 - npu+gpu: the deployment with the decoder on the iGPU (runs/p3/offload-gpu/deploy/; DETRs only).
 Results go to runs/p5/energy.json (resumable, per deployment) and energy.md. Windows is kept awake and
 each deployment waits for mains power.
+P6 (review), --p6: results in runs/p6/, 20 s inference windows, the NPU deployment confirmed on held-out
+images when P6 re-ran it (runs/p6/confirm/), and two more deployments:
+- gpu-optimized: the same optimizer for the iGPU (runs/p6/igpu-confirm/deploy/, else runs/p6/igpu/deploy/), when
+  it applied something;
+- npu-turbo: the NPU deployment (optimized, else the original) compiled with NPU_TURBO.
 
     python -m benchmarks.p5.energy                       # the 10 models of the paper
     python -m benchmarks.p5.energy yolo26-n:fp16 ...     # or given ones
+    python -m benchmarks.p5.energy --p6
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ from optinpu.tasks import ClassificationTask, Deployed, task_from_dict, task_to_
 
 CLASSIFIERS = ("resnet50_cls224:fp32", "mobilenet_v2_cls224:fp32", "efficientnet_b0_cls224:fp32")
 P3, OUT = ROOT / "runs" / "p3", ROOT / "runs" / "p5"
+P6 = ROOT / "runs" / "p6"
 CHANNELS = {"package": "PKG", "cores": "PP0", "igpu": "PP1"}
 IMAGES, ROUNDS, SETTLE, IDLE, ACTIVE = 8, 3, 1.0, 4.0, 8.0  # images, rounds, seconds
 
@@ -131,10 +138,10 @@ def summarize(rounds: list[dict]) -> dict:
             "rounds": rounds}
 
 
-def measure(task, parts: list, images: list[str]) -> dict:
+def measure(task, parts: list, images: list[str], active: float = ACTIVE) -> dict:
     """Energy of one deployment, in a watched child process (whole tree killed on a limit)."""
     spec = {"task": task_to_dict(task), "parts": parts, "images": images, "rounds": ROUNDS, "settle": SETTLE,
-            "idle": IDLE, "active": ACTIVE}
+            "idle": IDLE, "active": active}
     with tempfile.TemporaryDirectory(prefix="optinpu-energy-") as tmp:
         spec_file = Path(tmp) / "spec.json"
         spec_file.write_text(json.dumps(spec), encoding="utf-8")
@@ -147,8 +154,13 @@ def measure(task, parts: list, images: list[str]) -> dict:
     return {"error": (watched.status or last)[-200:]}
 
 
-def optimized(name: str, precision: str, entry) -> Path | None:
-    """Folder of the NPU deployment of P3.5 (rebuilt and saved if missing), None if nothing was applied."""
+def optimized(name: str, precision: str, entry, p6: bool = False) -> Path | None:
+    """Folder of the NPU deployment of P3.5 (rebuilt and saved if missing), None if nothing was applied.
+    With p6, the deployment re-run with the held-out confirmation, when there is one (runs/p6/confirm/)."""
+    confirmed = P6 / "confirm" / f"optimize_{name}_{precision}.json"
+    if p6 and confirmed.exists():
+        applied = json.loads(confirmed.read_text())["applied"]
+        return None if applied == "original" else P6 / "confirm" / "deploy" / f"{name}_{precision}"
     record = json.loads((P3 / f"optimize_{name}_{precision}.json").read_text())
     if record["applied"] == "original":
         return None
@@ -161,18 +173,26 @@ def optimized(name: str, precision: str, entry) -> Path | None:
     return directory
 
 
-def deployments(name: str, precision: str, entry) -> dict[str, list]:
+def deployments(name: str, precision: str, entry, p6: bool = False) -> dict[str, list]:
     """label -> parts ([[ir, device, config]]), in measurement order (the CPU last: it heats the package)."""
     parts = lambda directory: [[str(p), d, c] for p, d, c in load_deployment(directory)]
     ir = str(entry.irs[precision])
     out = {"npu": [[ir, "npu", None]]}
-    directory = optimized(name, precision, entry)
+    directory = optimized(name, precision, entry, p6)
     if directory is not None:
         out["npu-optimized"] = parts(directory)
+    if p6:
+        best = out.get("npu-optimized", out["npu"])
+        out["npu-turbo"] = [[p, d, {**(c or {}), "NPU_TURBO": True} if d == "npu" else c] for p, d, c in best]
     hybrid = P3 / "offload-gpu" / "deploy" / f"{name}_{precision}"
     if hybrid.exists():
         out["npu+gpu"] = parts(hybrid)
-    return {**out, "gpu": [[ir, "gpu", None]], "cpu": [[ir, "cpu", None]]}
+    out["gpu"] = [[ir, "gpu", None]]
+    # the iGPU run with the held-out confirmation when there is one, else the one of night 1
+    folder = next((f for f in (P6 / "igpu-confirm", P6 / "igpu") if (f / f"optimize_{name}_{precision}.json").exists()), None)
+    if p6 and folder and json.loads((folder / f"optimize_{name}_{precision}.json").read_text())["applied"] != "original":
+        out["gpu-optimized"] = parts(folder / "deploy" / f"{name}_{precision}")
+    return {**out, "cpu": [[ir, "cpu", None]]}
 
 
 def line(r: dict) -> str:
@@ -201,28 +221,32 @@ def main() -> None:
         print("RESULT " + json.dumps(child(json.loads(Path(sys.argv[2]).read_text(encoding="utf-8")))), flush=True)
         return
     EnergyMeter()  # fails early without the counters
-    OUT.mkdir(parents=True, exist_ok=True)
-    path = OUT / "energy.json"
+    p6 = "--p6" in sys.argv[1:]
+    specs = [a for a in sys.argv[1:] if a != "--p6"]
+    out = P6 if p6 else OUT
+    active = 20.0 if p6 else ACTIVE
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "energy.json"
     results = json.loads(path.read_text()) if path.exists() else {}
     keep_awake(True)
     try:
-        for spec in sys.argv[1:] or (*DETECTORS, *CLASSIFIERS):
+        for spec in specs or (*DETECTORS, *CLASSIFIERS):
             name, precision = spec.split(":")
             entry = next(m for m in all_models() if m.name == name)
             subset = imagenetv2_subset(IMAGES) if isinstance(entry.task, ClassificationTask) else coco_val_subset(IMAGES)
             images = [str(p) for p in subset.image_paths()]
             done = results.setdefault(spec, {})
-            for label, parts in deployments(name, precision, entry).items():
+            for label, parts in deployments(name, precision, entry, p6).items():
                 if label in done:
                     continue
                 wait_for_mains()
-                done[label] = measure(entry.task, parts, images)
+                done[label] = measure(entry.task, parts, images, active)
                 path.write_text(json.dumps(results, indent=1))
                 print(f"{stamp()} {spec} {label}: {line(done[label])}", flush=True)
     finally:
         keep_awake(False)
     text = summary(results)
-    (OUT / "energy.md").write_text(text, encoding="utf-8")
+    (out / "energy.md").write_text(text, encoding="utf-8")
     print(f"\n{text}", flush=True)
 
 

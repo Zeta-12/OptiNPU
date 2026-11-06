@@ -2,16 +2,19 @@
 
 fig_power.tex: package power while inferring back to back, per model and deployment (runs/p5/energy.json;
 the NPU deployment is the optimized one when something was applied).
+With --p6: runs/p6/energy.json (20 s windows, the NPU deployment confirmed on held-out images), the iGPU
+deployment optimized when the iGPU run applied something; the turbo variant is left out.
 
 Colors: the first four slots of the dataviz categorical palette (validated for color vision
 deficiencies); every series also has its own marker shape, for grayscale print.
 
-    python -m benchmarks.p5.figures
+    python -m benchmarks.p5.figures [--p6]
 """
 
 from __future__ import annotations
 
 import json
+import sys
 
 from benchmarks.m0.baselines import ROOT
 
@@ -28,22 +31,24 @@ def colors() -> str:
     return "".join(f"\\definecolor{{c{k.replace('+', '')}}}{{HTML}}{{{v}}}\n" for k, v in COLORS.items())
 
 
-def power_figure() -> str:
+def power_figure(p6: bool = False) -> str:
     """Dot plot: one row per model (top to bottom in the paper's order), package power on a linear axis."""
-    results = json.loads((ROOT / "runs" / "p5" / "energy.json").read_text())
+    results = json.loads((ROOT / "runs" / ("p6" if p6 else "p5") / "energy.json").read_text())
     rows = []
     for spec, done in results.items():
         model = {}
         for label, r in done.items():
-            if "error" in r or (label == "npu" and "npu-optimized" in done):
-                continue  # the NPU deployment is the optimized one when something was applied
-            model["npu" if label == "npu-optimized" else label] = r["active_w"]["package"]
+            if "error" in r or label == "npu-turbo" or (label == "npu" and "npu-optimized" in done) or \
+                    (label == "gpu" and "gpu-optimized" in done):
+                continue  # the NPU (iGPU) deployment is the optimized one when something was applied
+            model[{"npu-optimized": "npu", "gpu-optimized": "gpu"}.get(label, label)] = r["active_w"]["package"]
         rows.append((MODEL_NAMES[spec.split(":")[0]], model))
     n = len(rows)
     y = {name: n - i for i, (name, _) in enumerate(rows)}
     labels = ",".join(name for name, _ in reversed(rows))
+    xmax = 25 if p6 else 28
     out = [colors(), r"\begin{tikzpicture}",
-           f"\\begin{{axis}}[scale only axis, width=0.72\\columnwidth, height=3.6cm, xmin=0, xmax=28,"
+           f"\\begin{{axis}}[scale only axis, width=0.72\\columnwidth, height=3.6cm, xmin=0, xmax={xmax},"
            f" ymin=0.4, ymax={n + 0.6}, xtick pos=bottom, xtick={{0,5,...,25}},",
            f"  ytick={{1,...,{n}}}, yticklabels={{{labels}}}, xlabel={{Package power while inferring (W)}},",
            r"  tick label style={font=\scriptsize}, label style={font=\footnotesize}, axis line style={black!60},",
@@ -64,7 +69,7 @@ def power_figure() -> str:
 
 
 def main() -> None:
-    (PAPER / "fig_power.tex").write_text(power_figure(), encoding="utf-8")
+    (PAPER / "fig_power.tex").write_text(power_figure("--p6" in sys.argv[1:]), encoding="utf-8")
     print(f"wrote {PAPER / 'fig_power.tex'}")
 
 

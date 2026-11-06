@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from benchmarks.m0.baselines import ROOT
 from benchmarks.p2.optimize_model import OUT, on_ac_power
@@ -78,11 +79,17 @@ def main() -> None:
     parser.add_argument("models", nargs="*", help="model:precision (default: the P3.5 list)")
     parser.add_argument("--offload", default="", help="devices for a heavy tail, e.g. gpu (benchmarks.p2.optimize_model)")
     parser.add_argument("--images", type=int, help="val2017 images [0, N) for the final AP (default: the bench's)")
+    parser.add_argument("--device", default="npu", choices=("npu", "gpu"), help="device to optimize for")
+    parser.add_argument("--confirm", action="store_true", help="confirm accepted approximations on held-out images")
+    parser.add_argument("--out", type=Path, help="results folder (logs in its campaign/ subfolder)")
     args = parser.parse_args()
     models = args.models or MODELS
     options = (["--offload", args.offload] if args.offload else []) + (["--images", str(args.images)] if args.images else [])
+    options += ["--device", args.device] + (["--confirm"] if args.confirm else []) + (["--out", str(args.out)] if args.out else [])
     devices = "-".join(d for d in args.offload.split(",") if d)
     logs, out = (LOGS / f"offload-{devices}", OUT / f"offload-{devices}") if devices else (LOGS, OUT)
+    if args.out:
+        logs, out = args.out / "campaign", args.out
     logs.mkdir(parents=True, exist_ok=True)
     print(f"{stamp()} campaign: {', '.join(models)} {' '.join(options)}", flush=True)
     keep_awake(True)

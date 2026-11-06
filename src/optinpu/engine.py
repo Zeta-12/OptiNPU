@@ -6,6 +6,7 @@ import contextlib
 import copy
 import json
 import math
+import os
 import random
 import shutil
 import time
@@ -42,6 +43,11 @@ class TrainConfig:
     resume: str | None = None
     # stop after the last epoch that fits in this budget, e.g. under a session time limit (Kaggle: 12 h)
     max_hours: float | None = None
+    # last epochs without mosaic augmentation (CocoDetection.mosaic), as YOLOv8 does: back to real images
+    close_mosaic: int = 0
+    # > 0: color jitter (brightness, contrast, saturation x U(1 - c, 1 + c)) on the training device instead of
+    # in the data workers (CocoDetection.jitter): frees CPU when loading bounds training (Kaggle: 4 CPUs)
+    color_jitter: float = 0.0
     log_every: int = 20
     freeze_backbone: bool = False
     # Run the (frozen) backbone on another OpenVINO device, e.g. "npu": features of the next batch
@@ -135,6 +141,59 @@ def _batches(loader, external_backbone):
             yield current[0], current[1], current_future.result()
 
 
+def _color_jitter(x: torch.Tensor, c: float) -> torch.Tensor:
+    """CocoDetection's jitter (PIL ImageEnhance Brightness, Contrast, Color, factors U(1 - c, 1 + c)) on a
+    batch (B, 3, H, W) in [0, 1]: blends with black, the mean gray level, then the grayscale image."""
+    def factor():
+        return torch.empty(x.shape[0], 1, 1, 1, device=x.device).uniform_(1 - c, 1 + c)
+
+    def gray(t):  # ITU-R 601-2 luma, as PIL's "L" mode
+        return (0.299 * t[:, 0:1] + 0.587 * t[:, 1:2] + 0.114 * t[:, 2:3])
+
+    x = (x * factor()).clamp_(0, 1)
+    mean = gray(x).mean((2, 3), keepdim=True)
+    x = ((x - mean) * factor() + mean).clamp_(0, 1)
+    g = gray(x)
+    return ((x - g) * factor() + g).clamp_(0, 1)
+
+
+def _distributed(cfg: TrainConfig) -> tuple[int, int, torch.device]:
+    """(rank, number of processes, device). Launched by torchrun with WORLD_SIZE > 1: one process per GPU,
+    gradients averaged by DistributedDataParallel; `batch` stays the global batch. Otherwise (0, 1, device)."""
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world == 1:
+        return 0, 1, torch_device(cfg.device)
+    import torch.distributed as dist
+
+    cuda = torch.cuda.is_available() and cfg.device != "cpu"
+    local = int(os.environ["LOCAL_RANK"])
+    if cuda:
+        torch.cuda.set_device(local)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl" if cuda else "gloo")
+    return dist.get_rank(), world, torch.device("cuda", local) if cuda else torch.device("cpu")
+
+
+class _Loss(nn.Module):
+    """forward() = model.loss(): DistributedDataParallel synchronizes gradients through forward() only."""
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixels, targets):
+        return self.model.loss(pixels, targets)
+
+
+def _all_true(flag: bool, world: int, device: torch.device) -> bool:
+    """`flag` and-ed over all processes: every process must take the same branch, or they deadlock."""
+    if world == 1:
+        return flag
+    t = torch.tensor([float(flag)], device=device)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+    return bool(t.item())
+
+
 def _amp_dtype(amp: bool | str) -> torch.dtype | None:
     """Autocast dtype of TrainConfig.amp; None: FP32."""
     if amp is False or amp is None:
@@ -175,10 +234,15 @@ def train(
 ) -> TrainResult:
     """Train `model` (must expose .loss(pixels, targets)); keep the best EMA weights by val mAP.
     `checkpoint_extra` entries are saved in the checkpoint as is (e.g. the QAT quantizer config).
-    The whole training state goes to last.pt after every epoch, for TrainConfig.resume."""
+    The whole training state goes to last.pt after every epoch, for TrainConfig.resume.
+    Under torchrun (one process per GPU) only process 0 evaluates, saves and prints."""
     from optinpu.evaluate import evaluate_coco
 
-    device = torch_device(cfg.device)
+    rank, world, device = _distributed(cfg)
+    main = rank == 0
+    log = print if main else (lambda *args, **kwargs: None)
+    if cfg.batch % world:
+        raise ValueError(f"batch {cfg.batch} is not a multiple of the {world} processes")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     amp_dtype = _amp_dtype(cfg.amp)
@@ -192,10 +256,21 @@ def train(
     model = model.to(device).train()
     ema = EMA(model, cfg.ema_decay)
 
-    loader = torch.utils.data.DataLoader(
-        train_set, batch_size=cfg.batch, shuffle=True, num_workers=cfg.workers,
-        collate_fn=collate, drop_last=True, persistent_workers=cfg.workers > 0,
-    )
+    def make_loader():
+        sampler, generator = None, None
+        if world > 1:  # each process takes its share of every global batch
+            sampler = torch.utils.data.DistributedSampler(train_set, world, rank, shuffle=True, drop_last=True)
+            # workers seed their augmentations from this generator: a different stream per process
+            generator = torch.Generator().manual_seed(int(torch.randint(2**62, ())) + rank)
+        return torch.utils.data.DataLoader(
+            train_set, batch_size=cfg.batch // world, shuffle=sampler is None, sampler=sampler,
+            num_workers=cfg.workers, collate_fn=collate, drop_last=True, persistent_workers=cfg.workers > 0,
+            generator=generator,
+        )
+
+    if cfg.color_jitter and hasattr(train_set, "jitter"):
+        train_set.jitter = False  # done on the device below
+    loader = make_loader()
     total_steps = cfg.epochs * len(loader)
     if cfg.max_steps:
         total_steps = min(total_steps, cfg.max_steps)
@@ -217,29 +292,42 @@ def train(
     start_epoch, step = 0, 0
     if cfg.resume:
         start_epoch, step = _resume(Path(cfg.resume), cfg, len(loader), model, ema, optimizer, scaler, result)
-    print(f"Training {name} on {device}: {len(train_set)} images, {len(loader)} steps/epoch, {cfg.epochs} epochs"
-          + (f", {amp_dtype} autocast" if amp_dtype else "")
-          + (f", resuming at epoch {start_epoch}" if start_epoch else ""))
+    net = _Loss(model)
+    if world > 1:  # after resuming: DDP starts every process from process 0's weights
+        net = nn.parallel.DistributedDataParallel(net, device_ids=[device.index] if device.type == "cuda" else None)
+    log(f"Training {name} on {device}" + (f" x {world} processes" if world > 1 else "")
+        + f": {len(train_set)} images, {len(loader)} steps/epoch, {cfg.epochs} epochs"
+        + (f", {amp_dtype} autocast" if amp_dtype else "")
+        + (f", resuming at epoch {start_epoch}" if start_epoch else ""))
     started = time.perf_counter()
     for epoch in range(start_epoch, cfg.epochs):
+        if getattr(train_set, "mosaic", 0) and cfg.close_mosaic and epoch >= cfg.epochs - cfg.close_mosaic:
+            train_set.mosaic = 0.0
+            loader = make_loader()  # persistent workers hold their own copy of the dataset
+            log(f"epoch {epoch}: mosaic off for the last {cfg.close_mosaic} epochs")
+        if world > 1:
+            loader.sampler.set_epoch(epoch)
         model.train()
         t0, losses = time.perf_counter(), []
         for pixels, targets, features in _batches(loader, external_backbone):
             for g, base in zip(optimizer.param_groups, base_lrs):
                 g["lr"] = base * lr_factor(step)
             pixels = _float_pixels(pixels.to(device, non_blocking=True))
+            if cfg.color_jitter:
+                pixels = _color_jitter(pixels, cfg.color_jitter)
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             backbone_ctx = contextlib.nullcontext()
             if features is not None:
                 backbone_ctx = model.external_backbone([torch.from_numpy(f).to(device) for f in features])
             with torch.autocast(device.type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None), \
                     backbone_ctx:
-                loss, parts = model.loss(pixels, targets)
-            if not torch.isfinite(loss):
-                print(f"step {step}: non-finite loss, batch skipped")
+                loss, parts = net(pixels, targets)
+            # backward even on a non-finite loss: with DDP every process takes part in the gradient averaging
+            scaler.scale(loss).backward()
+            if not _all_true(bool(torch.isfinite(loss)), world, device):
+                log(f"step {step}: non-finite loss, batch skipped")
                 optimizer.zero_grad(set_to_none=True)
                 continue
-            scaler.scale(loss).backward()
             if cfg.clip:
                 scaler.unscale_(optimizer)  # clip the true gradients
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.clip)
@@ -249,7 +337,7 @@ def train(
             ema.update(model)
             losses.append(loss.item())
             step += 1
-            if step % cfg.log_every == 0:
+            if step % cfg.log_every == 0 and main:
                 rate = len(losses) * cfg.batch / (time.perf_counter() - t0)
                 print(f"epoch {epoch} step {step}/{total_steps} loss {np.mean(losses[-cfg.log_every:]):.3f} "
                       f"lr {optimizer.param_groups[-1]['lr']:.2e} {rate:.1f} img/s")
@@ -258,34 +346,41 @@ def train(
 
         record = {"epoch": epoch, "loss": float(np.mean(losses)) if losses else float("nan"),
                   "seconds": time.perf_counter() - t0}
-        if val_subset is not None:
-            predictor = TorchPredictor(ema.module, name, train_set.imgsz, train_set.class_names)
-            ev = evaluate_coco(predictor, val_subset, device="torch", precision="fp32")
-            record.update(AP=ev.AP, AP50=ev.AP50)
-        result.history.append(record)
-        print(f"epoch {epoch}: " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                                             for k, v in record.items()))
+        if main:
+            if val_subset is not None:
+                predictor = TorchPredictor(ema.module, name, train_set.imgsz, train_set.class_names)
+                ev = evaluate_coco(predictor, val_subset, device="torch", precision="fp32")
+                record.update(AP=ev.AP, AP50=ev.AP50)
+            result.history.append(record)
+            print(f"epoch {epoch}: " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                                 for k, v in record.items()))
 
-        score = record.get("AP", -record["loss"])
-        if score > result.best_ap:
-            result.best_ap, result.best_epoch = score, epoch
-            torch.save({"state_dict": ema.module.state_dict(), "class_names": train_set.class_names,
-                        "epoch": epoch, "config": asdict(cfg), **(checkpoint_extra or {})}, result.checkpoint)
-        (out_dir / "history.json").write_text(json.dumps(result.history, indent=2))
-        state = {"model": model.state_dict(), "ema": ema.module.state_dict(), "ema_updates": ema.updates,
-                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch, "step": step,
-                 "steps_per_epoch": len(loader), "best_ap": result.best_ap, "best_epoch": result.best_epoch,
-                 "history": result.history, "rng": (torch.get_rng_state(), random.getstate()), "config": asdict(cfg)}
-        torch.save(state, out_dir / "last.pt.tmp")  # a run killed while saving keeps the previous last.pt
-        (out_dir / "last.pt.tmp").replace(out_dir / "last.pt")
+            score = record.get("AP", -record["loss"])
+            if score > result.best_ap:
+                result.best_ap, result.best_epoch = score, epoch
+                torch.save({"state_dict": ema.module.state_dict(), "class_names": train_set.class_names,
+                            "epoch": epoch, "config": asdict(cfg), **(checkpoint_extra or {})}, result.checkpoint)
+            (out_dir / "history.json").write_text(json.dumps(result.history, indent=2))
+            state = {"model": model.state_dict(), "ema": ema.module.state_dict(), "ema_updates": ema.updates,
+                     "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(), "epoch": epoch,
+                     "step": step, "steps_per_epoch": len(loader), "best_ap": result.best_ap,
+                     "best_epoch": result.best_epoch, "history": result.history,
+                     "rng": (torch.get_rng_state(), random.getstate()), "config": asdict(cfg)}
+            torch.save(state, out_dir / "last.pt.tmp")  # a run killed while saving keeps the previous last.pt
+            (out_dir / "last.pt.tmp").replace(out_dir / "last.pt")
+        if world > 1:
+            torch.distributed.barrier()  # the other processes wait for process 0's validation and checkpoints
         if cfg.max_steps and step >= cfg.max_steps:
             break
         if cfg.max_hours and epoch + 1 < cfg.epochs:
             elapsed, done = time.perf_counter() - started, epoch + 1 - start_epoch
-            if elapsed * (done + 1) / done > cfg.max_hours * 3600:
-                print(f"stopping after epoch {epoch}: the next one would exceed max_hours={cfg.max_hours} "
-                      f"({elapsed / 3600:.2f} h so far); resume from {out_dir / 'last.pt'}")
+            # process 0 decides for all (the others vote "stop")
+            if _all_true(elapsed * (done + 1) / done > cfg.max_hours * 3600 or not main, world, device):
+                log(f"stopping after epoch {epoch}: the next one would exceed max_hours={cfg.max_hours} "
+                    f"({elapsed / 3600:.2f} h so far); resume from {out_dir / 'last.pt'}")
                 break
+    if world > 1:
+        torch.distributed.destroy_process_group()
     return result
 
 

@@ -19,6 +19,18 @@ def test_dataset_targets_are_normalized_cxcywh(toy_coco):
     assert target["class_labels"].tolist() == [1]
 
 
+def test_dataset_reads_a_shrunk_copy_of_the_images(toy_coco, tmp_path):
+    from PIL import Image
+
+    ann, image_dir = toy_coco
+    small = tmp_path / "small"
+    small.mkdir()
+    for path in image_dir.glob("*.jpg"):
+        Image.open(path).resize((100, 50)).save(small / path.name)  # half size; annotations unchanged
+    pixels, target = CocoDetection(ann, small, imgsz=(64, 64))[0]
+    torch.testing.assert_close(target["boxes"], torch.tensor([[0.25, 0.3, 0.3, 0.4]]))  # as from full size
+
+
 def test_random_zoom_keeps_boxes_consistent():
     import numpy as np
     from PIL import Image
@@ -43,6 +55,36 @@ def test_dataset_flip_mirrors_boxes(toy_coco, monkeypatch):
     monkeypatch.setattr(random, "uniform", lambda a, b: 1.0)  # no color jitter
     _, target = ds[0]
     torch.testing.assert_close(target["boxes"], torch.tensor([[0.75, 0.3, 0.3, 0.4]]))
+
+
+def test_mosaic_boxes_land_on_their_objects(tmp_path):
+    import json
+
+    from PIL import Image, ImageDraw
+
+    images, annotations = [], []
+    for i in range(1, 5):  # white boxes on black images: a box is right if its center pixel is white
+        image = Image.new("RGB", (200, 100))
+        box = [10 * i, 5 * i, 50 + 10 * i, 30 + 5 * i]  # xywh
+        ImageDraw.Draw(image).rectangle([box[0], box[1], box[0] + box[2] - 1, box[1] + box[3] - 1], fill="white")
+        image.save(tmp_path / f"{i}.jpg", quality=95)
+        images.append({"id": i, "file_name": f"{i}.jpg", "width": 200, "height": 100})
+        annotations.append({"id": i, "image_id": i, "category_id": 1, "bbox": box, "area": box[2] * box[3]})
+    (tmp_path / "ann.json").write_text(json.dumps({"images": images, "annotations": annotations,
+                                                   "categories": [{"id": 1, "name": "box"}]}))
+    ds = CocoDetection(tmp_path / "ann.json", tmp_path, imgsz=(96, 128), augment=True, mosaic=1.0)
+    n_boxes = 0
+    for seed in range(40):
+        random.seed(seed)
+        pixels, target = ds[seed % 4]
+        assert pixels.shape == (3, 96, 128)
+        assert len(target["boxes"]) == len(target["class_labels"])
+        for cx, cy, w, h in target["boxes"].tolist():
+            assert 0 < w <= 1 and 0 < h <= 1
+            # white is >= 148 after the color jitter, black stays under 60
+            assert pixels[:, int(cy * 96), int(cx * 128)].min() > 100, (seed, cx, cy)
+            n_boxes += 1
+    assert n_boxes > 40  # several of the 4 images visible per mosaic
 
 
 class ToyDetector(nn.Module):
@@ -113,6 +155,64 @@ def test_resume_matches_an_uninterrupted_run(toy_coco, tmp_path):
     assert result.checkpoint.exists()
     with pytest.raises(ValueError, match="schedule"):
         run("other", resume=last, epochs=4)
+
+
+def test_device_color_jitter_matches_pil():
+    import numpy as np
+    from PIL import Image, ImageEnhance
+
+    from optinpu.engine import _color_jitter
+
+    rng = np.random.default_rng(0)
+    images = [Image.fromarray(rng.integers(0, 256, (24, 32, 3), dtype=np.uint8)) for _ in range(3)]
+    x = torch.stack([torch.from_numpy(np.array(im)).permute(2, 0, 1) for im in images]).float() / 255
+    torch.manual_seed(0)
+    out = _color_jitter(x, 0.3)
+    torch.manual_seed(0)  # the same draws: brightness, contrast, saturation factors per image
+    factors = [torch.empty(3, 1, 1, 1).uniform_(0.7, 1.3).flatten().tolist() for _ in range(3)]
+    for i, image in enumerate(images):
+        for enhancer, f in zip((ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color), factors):
+            image = enhancer(image).enhance(f[i])
+        expected = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255
+        assert (out[i] - expected).abs().max() < 4 / 255  # PIL rounds to uint8 after each step
+
+
+def _ddp_worker(rank, world, port, toy, out, queue):
+    import os
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), WORLD_SIZE=str(world), RANK=str(rank),
+                      LOCAL_RANK=str(rank), USE_LIBUV="0")
+    torch.manual_seed(rank)  # different initial weights: DDP must start both from process 0's
+    ds = CocoDetection(*toy, imgsz=(32, 32), augment=True)
+    cfg = TrainConfig(epochs=2, batch=4, lr=1e-2, backbone_lr=1e-2, warmup_steps=1, workers=0, device="cpu",
+                      log_every=100, max_hours=1e-9)
+    model = ToyDetector()
+    result = train(model, ds, None, cfg, out, "toy")
+    queue.put((rank, [v.clone() for v in model.state_dict().values()], len(result.history)))
+
+
+def test_ddp_keeps_processes_in_sync(toy_coco, tmp_path):
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [ctx.Process(target=_ddp_worker, args=(r, 2, port, toy_coco, tmp_path / "run", queue)) for r in range(2)]
+    for p in procs:
+        p.start()
+    results = dict((r, (w, n)) for r, w, n in (queue.get(timeout=120) for _ in procs))
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0
+    for a, b in zip(results[0][0], results[1][0]):
+        torch.testing.assert_close(a, b)  # same weights after training: gradients were averaged
+    # process 0 alone records, saves and decides to stop (max_hours) for both after the first epoch
+    assert results[0][1] == 1 and results[1][1] == 0
+    assert (tmp_path / "run" / "last.pt").exists() and (tmp_path / "run" / "best.pt").exists()
 
 
 def test_fp16_trains_with_loss_scaling(toy_coco, tmp_path):

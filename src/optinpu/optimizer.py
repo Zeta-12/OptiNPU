@@ -159,6 +159,7 @@ class Trial:
     accepted: bool = False
     note: str = ""
     ap: float | None = None  # task metric (AP, top-1) on the evaluation set, judged candidates only
+    ci_ms: float | None = None  # 95 % half-width of the paired saving behind latency_ms
 
 
 @dataclass
@@ -341,6 +342,8 @@ def optimize(
     recommend: bool = True,
     rounds: int = 5,
     iterations: int = 30,
+    confirmation=None,
+    confirmation_folds: int | None = None,
     log=print,
 ) -> OptimizationReport:
     """Optimize `model` (ov.Model or IR path) for `device`; see the module docstring.
@@ -356,6 +359,11 @@ def optimize(
     module groups of a mixed precision search (the final mix uses all of `calibration`).
     offload: devices ("gpu", "cpu") that may run more than a light selection tail, e.g. a DETR decoder;
     default none: the network runs on `device` and only host post-processing leaves it.
+    confirmation: another annotated set, disjoint from `evaluation` (in `confirmation_folds` folds, default
+    `folds`): an approximation that passes the test on `evaluation` (full INT8, or the first mix of a mixed
+    precision search) must pass it once more on these images. Keeping the first of several noisy tests that
+    passes favours an underestimated loss (ResNet-50's mix: no loss on the decision images, -0.64 points on
+    the report ones, PLAN.md P5); one more test on fresh images is not biased by that selection.
     """
     from optinpu.sandbox import run_evaluation, run_predictions
 
@@ -381,6 +389,26 @@ def optimize(
         return result["score"], result["fold_scores"], ""
 
     reference_folds: list[float] = []
+    confirmation_reference: list[float] = []
+
+    def confirm(parts) -> tuple[bool, str]:
+        """(the loss stays within the budget on the confirmation images too, verdict); always true without
+        a confirmation set."""
+        if confirmation is None:
+            return True, ""
+        n = confirmation_folds or folds
+        if not confirmation_reference:
+            result, job = run_evaluation([(model, "cpu", None)], task, confirmation, folds=n)
+            if result is None:
+                raise RuntimeError(f"evaluation of the original on the confirmation set failed: {job.error}")
+            confirmation_reference[:] = result["fold_scores"]
+        result, job = run_evaluation(parts, task, confirmation, folds=n)
+        if result is None:
+            return False, " (confirmation failed: " + ("NPU lost" if job.device_lost else (job.error or "")[-100:]) + ")"
+        ok, mean, margin = ap_within_budget(result["fold_scores"], confirmation_reference, ap_budget)
+        word = "confirmed" if ok else "NOT confirmed"
+        return ok, (f" ({word} on held-out images: {metric} {100 * mean:+.2f} points, 95 % lower bound "
+                    f"{100 * (mean - margin):+.2f})")
 
     def judge(parts) -> tuple[bool, float | None, str]:
         """(metric loss vs the CPU FP32 original within the budget with 95 % confidence, metric, verdict)."""
@@ -478,7 +506,7 @@ def optimize(
             t = measure({"current": base.parts(device), "mixed": mixed.parts(device)}, device, rounds=rounds,
                         iterations=iterations, adaptive=adaptive)
             saving, ci = paired_saving(t, "current", "mixed")
-            trial = Trial(mixed.label(), "approx", current_ms - saving,
+            trial = Trial(mixed.label(), "approx", current_ms - saving, ci_ms=ci,
                           note=f"{len(chosen)} of {len(groups)} module groups kept in float")
             report.trials.append(trial)
             if not (saving - ci > 0 and saving > 0.01 * current_ms):
@@ -486,8 +514,12 @@ def optimize(
                 return None
             ok, trial.ap, verdict = judge(mixed.parts(device))
             if ok:
-                trial.agreement, _ = accuracy(mixed)
                 trial.note += f" ({verdict})"
+                confirmed, note = confirm(mixed.parts(device))
+                trial.note += note
+                if not confirmed:  # one confirmation per search: trying the next mix would select again
+                    return None
+                trial.agreement, _ = accuracy(mixed)
                 return mixed, trial
             trial.note += f" ({verdict})"
         return None
@@ -511,7 +543,7 @@ def optimize(
         for i in order:
             candidate, kind, description = neighbours[i]
             t, (saving, ci) = timings[f"n{i}"], savings[i]
-            trial = Trial(candidate.label(), kind, current_ms - saving, note=description)
+            trial = Trial(candidate.label(), kind, current_ms - saving, note=description, ci_ms=ci)
             repaired = False
             report.trials.append(trial)
             if t.error is not None:
@@ -530,6 +562,11 @@ def optimize(
             if kind == "approx" and evaluation is not None:
                 ok, trial.ap, verdict = judge(candidate.parts(device))
                 trial.note += f" ({verdict})"
+                if ok:
+                    confirmed, note = confirm(candidate.parts(device))
+                    trial.note += note
+                    if not confirmed:
+                        continue
                 if not ok:
                     transformer = candidate.changes[-1] == "int8-transformer"
                     key = (id(state.model), transformer)
